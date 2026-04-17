@@ -40,14 +40,16 @@ class LLMClient:
             if not statements:
                 return "unknown"
             stmt = statements[0]
-            if isinstance(stmt, (exp.Select,)):
+            if isinstance(stmt, exp.Select):
                 return "read"
             if isinstance(stmt, (exp.Insert, exp.Update, exp.Delete)):
                 return "write"
-            if isinstance(
-                stmt,
-                (exp.Create, exp.Drop, exp.AlterTable),
-            ):
+            # sqlglot.expressions.ddl.DDL is the base for Create/Drop/Alter
+            ddl_base = getattr(exp, "DDL", None)
+            if ddl_base and isinstance(stmt, ddl_base):
+                return "ddl"
+            # Fallback: check by class name for older sqlglot versions
+            if stmt.__class__.__name__ in ("Create", "Drop", "AlterTable"):
                 return "ddl"
             return "unknown"
         except Exception:
