@@ -68,13 +68,17 @@ Each node owns two things:
 
 ### 1. Memory Document
 
-A structured markdown file that is the node's persistent (ish) state. Updated after every write. The LLM reads this at the start of every query.
+A structured markdown file that is the node's persistent (ish) state. Updated after every write. The LLM reads this at the start of every query. The `## Schema` section is always present and updated via DDL gossip.
 
 ```markdown
 # Node: saturn
 # Vector Clock: {"saturn": 5, "pluton": 3, "neptune": 4}
 # Last Updated: 2026-04-17T12:00:00Z
 # Compaction Count: 2
+
+## Schema
+- users: id INTEGER, name TEXT, age INTEGER, city TEXT
+- orders: id INTEGER, user_id INTEGER, amount REAL
 
 ## Table: users
 | id | name  | age | city   |
@@ -116,36 +120,28 @@ Client  →  POST /query  →  Node saturn
                                               │
                                               ├─ LLM: read gossip message
                                               └─ memory.py: merge into memory doc
-
 ```
 
-### Gossip Message Format
+## Protocol: DDL Path
 
-Typed, versioned, replayable:
+DDL statements (`CREATE TABLE`, `ALTER TABLE`, `DROP TABLE`) are gossiped as a dedicated `ddl_change` message type. This ensures all nodes share a consistent schema definition, which the LLM uses to validate writes and format query results.
 
-```json
-{
-  "from": "saturn",
-  "type": "write",
-  "vector_clock": {"saturn": 5, "pluton": 3, "neptune": 4},
-  "statement": "INSERT INTO users (name, age) VALUES ('Alice', 30)",
-  "summary": "users table: added row id=1 name=Alice age=30"
-}
+```
+Client  →  POST /query  →  Node saturn
+                              │
+                              ├─ sqlglot: classify as DDL
+                              ├─ LLM: confirm and record schema change
+                              ├─ memory.py: update ## Schema section
+                              ├─ Return OK to client
+                              │
+                              └─ gossip.py: broadcast ddl_change to all peers (synchronous)
+                                    │
+                              POST /gossip  →  Node pluton, neptune
+                                              │
+                                              └─ memory.py: update ## Schema section
 ```
 
-The `summary` field is written by the sending LLM in natural language. The receiving LLM uses this (not only the raw SQL) to update its memory document. This is intentional — it lets nodes have subtly different interpretations. Chaos is part of the design.
-
-A compaction event is also gossiped so peers know the node's view has been condensed:
-
-```json
-{
-  "from": "saturn",
-  "type": "compaction",
-  "vector_clock": {"saturn": 6, "pluton": 3, "neptune": 4},
-  "compaction_count": 3,
-  "summary": "compacted users table (12 rows → summary), orders table unchanged"
-}
-```
+DDL gossip is **synchronous** — the client waits until all reachable peers have acknowledged before receiving OK. This is the one place NOODLE wears a hard hat. Schema drift between nodes is worse than data drift.
 
 ---
 
@@ -160,6 +156,71 @@ Client  →  POST /query  →  Node saturn
 ```
 
 The node returns its local view. It does not contact peers unless the consistency mode requires it (see NOODLE below).
+
+---
+
+## Gossip Message Types
+
+All gossip messages share a common envelope. The `type` field determines how the receiver processes the message.
+
+### `write`
+
+```json
+{
+  "from": "saturn",
+  "type": "write",
+  "vector_clock": {"saturn": 5, "pluton": 3, "neptune": 4},
+  "statement": "INSERT INTO users (name, age) VALUES ('Alice', 30)",
+  "summary": "users table: added row id=1 name=Alice age=30"
+}
+```
+
+The `summary` field is written by the sending LLM in natural language. The receiving LLM uses this (not only the raw SQL) to update its memory document. This is intentional — it lets nodes have subtly different interpretations. Chaos is part of the design.
+
+### `ddl_change`
+
+```json
+{
+  "from": "saturn",
+  "type": "ddl_change",
+  "vector_clock": {"saturn": 6, "pluton": 3, "neptune": 4},
+  "statement": "CREATE TABLE orders (id INTEGER, user_id INTEGER, amount REAL)",
+  "schema_snapshot": {
+    "users": "id INTEGER, name TEXT, age INTEGER, city TEXT",
+    "orders": "id INTEGER, user_id INTEGER, amount REAL"
+  }
+}
+```
+
+`schema_snapshot` is the full current schema after applying this DDL. Receivers replace their `## Schema` section wholesale — no merging, no LLM interpretation. Schema is the one thing that is applied literally.
+
+### `compaction`
+
+```json
+{
+  "from": "saturn",
+  "type": "compaction",
+  "vector_clock": {"saturn": 7, "pluton": 3, "neptune": 4},
+  "compaction_count": 3,
+  "summary": "compacted users table (12 rows → summary), orders table unchanged"
+}
+```
+
+### `correction`
+
+Sent by the Arbiter after the Argument Protocol resolves a conflict.
+
+```json
+{
+  "from": "neptune",
+  "type": "correction",
+  "vector_clock": {"saturn": 5, "pluton": 3, "neptune": 6},
+  "table": "users",
+  "row_id": 1,
+  "correct_value": {"name": "Alice", "age": 30, "city": "Berlin"},
+  "reason": "majority agreed on age=30; saturn's value age=31 was overruled"
+}
+```
 
 ---
 
@@ -179,9 +240,10 @@ When a node's memory document exceeds a configurable size threshold (default: 80
 
 1. LLM reads the full current memory document
 2. LLM rewrites it in a more compressed form: aggregating rows, summarising distributions, dropping data it considers "probably unimportant"
-3. New memory doc replaces the old one; the previous version is kept as `memory.pre-compact.md` for one cycle (for debugging)
-4. `Compaction Count` in the memory doc header is incremented
-5. A `compaction` gossip message is sent to peers
+3. The `## Schema` section is **always preserved verbatim** — schemas are never compacted
+4. New memory doc replaces the old one; the previous version is kept as `memory.pre-compact.md` for one cycle (for debugging)
+5. `Compaction Count` in the memory doc header is incremented
+6. A `compaction` gossip message is sent to peers
 
 ### The Lossy Compaction Problem
 
@@ -199,7 +261,7 @@ Remaining 48 rows summarised. Run COMPACT MEMORY AGGRESSIVE to lose more.
 
 ### Organic Eviction (Fallback)
 
-If compaction has not run and the context window hard-limits mid-query, the node truncates its memory document from the bottom (oldest rows first) and logs to `SHOW EVICTIONS`. This is the failure mode, not the primary strategy.
+If compaction has not run and the context window hard-limits mid-query, the node truncates its memory document from the bottom (oldest rows first) and logs to `SHOW EVICTIONS`. The `## Schema` section is always retained even during eviction. This is the failure mode, not the primary strategy.
 
 ---
 
@@ -219,6 +281,7 @@ Raft is a sturdy wooden raft: reliable, load-bearing, safe. NOODLE is a pool noo
 | Conflict detection | Prevented by design | Detected after the fact, argued about |
 | Split-brain recovery | Quorum prevents it | Largest memory doc wins |
 | Log compaction | Snapshot + truncate WAL | LLM rewrites memory with opinions |
+| Schema changes | Replicated log entry | Synchronous `ddl_change` gossip |
 | Failure model | Crash-fault tolerant | Vibe-fault tolerant |
 
 ### Leadership by Vibes
@@ -269,6 +332,8 @@ Set per-session: `SET CONSISTENCY = 'mode'`
 | `VIBE_CHECK` | Ask all nodes, return majority via Argument Protocol | Quorum read |
 | `GOSSIP_STORM` | Write + force immediate synchronous gossip to all peers | Synchronous replication |
 | `AMNESIA_SAFE` | Re-send full memory document on every gossip message | Anti-entropy repair |
+
+Note: DDL always uses synchronous gossip regardless of the session consistency mode.
 
 ---
 
@@ -321,6 +386,9 @@ COMPACT MEMORY ON saturn AGGRESSIVE;
 
 -- Show what was dropped in the last compaction or eviction
 SHOW EVICTIONS;
+
+-- Show the current gossiped schema across all nodes
+SHOW SCHEMA;
 ```
 
 ---
@@ -331,10 +399,11 @@ These are features.
 
 | Failure | What actually happens |
 |---|---|
-| **Memory doc too large** | Compaction triggers automatically. LLM rewrites memory in a denser form. Output may be lossy. `SELECT CONFIDENCE(*)` will reflect this. |
-| **Compaction not run, context hard-limits** | Node falls back to Organic Eviction: oldest rows truncated silently. `SHOW EVICTIONS` lists what was lost. |
+| **Memory doc too large** | Compaction triggers automatically. LLM rewrites memory in a denser form. Schema section preserved verbatim. `SELECT CONFIDENCE(*)` will reflect data loss. |
+| **Compaction not run, context hard-limits** | Node falls back to Organic Eviction: oldest rows truncated silently. Schema always retained. `SHOW EVICTIONS` lists what was lost. |
 | **Compaction divergence** | Two nodes compacted the same data differently. Detected on next `VIBE_CHECK`. Resolved by Argument Protocol. |
 | **Hallucination split-brain** | Two nodes invent different values for the same key. Detected on next `VIBE_CHECK`. Resolved by Argument Protocol. |
+| **DDL peer unreachable** | Synchronous `ddl_change` gossip fails for a node. Schema change is applied locally; the unreachable node is flagged as `SCHEMA_DIVERGED`. It receives the `ddl_change` when it rejoins. |
 | **Gossip loop** | A node re-gossips a message it received. Prevented by including `from` + vector clock; receivers deduplicate. |
 | **LLM refusal** | Node responds with an error: `ERROR: node saturn declined to store this data (ethical concern)`. The row is not inserted. Other nodes are not gossiped. |
 | **Confident wrongness** | `SELECT` returns plausible but fabricated data with no error. This is the default operating mode. |
@@ -345,13 +414,14 @@ These are features.
 
 ## Implementation Notes
 
-- **SQL parsing**: Use [`sqlglot`](https://github.com/tobymao/sqlglot) to classify intent (READ / WRITE / DDL / UNKNOWN). Do not write a SQL parser. Let the LLM handle interpretation.
+- **SQL parsing**: Use [`sqlglot`](https://github.com/tobymao/sqlglot) to classify intent (READ / WRITE / DDL / UNKNOWN). Do not write a SQL parser. Let the LLM handle interpretation of data; use the parsed schema for DDL gossip.
+- **DDL handling**: Schema changes are gossiped synchronously as `ddl_change` messages. The `schema_snapshot` field is applied literally by receivers — no LLM involved in schema updates. This is the one deterministic operation in vibeqlite.
 - **LLM backend**: Design for swappable backends. Start with [Ollama](https://ollama.com) locally (free, private). Abstract behind a `LLMClient` interface so OpenAI / Anthropic / etc. can slot in.
 - **Memory document format**: Markdown tables for human readability when debugging. The LLM can read markdown natively.
-- **Compaction threshold**: Configurable per node. Default 80% of the model's context window. Measure in tokens, not bytes.
-- **Vector clocks**: Lightweight dict `{node_id: int}`. Increment the local counter on every write and every compaction. Merge by taking the max of each component.
+- **Compaction threshold**: Configurable per node. Default 80% of the model's context window. Measure in tokens using `tiktoken` (for OpenAI-compatible models) or character count heuristic otherwise.
+- **Vector clocks**: Lightweight dict `{node_id: int}`. Increment the local counter on every write, DDL change, and compaction. Merge by taking the max of each component.
 - **Transport**: Simple HTTP with JSON bodies. No gRPC, no message bus. Nodes are HTTP servers.
-- **Node discovery**: Static config file for now (`cluster.yaml` listing peers). DNS-based discovery is a later problem.
+- **Node discovery**: Static config file (`cluster.yaml` listing peers). DNS-based discovery is a later problem.
 
 ---
 
@@ -359,14 +429,15 @@ These are features.
 
 1. Single node, single memory doc, single LLM call per query — no gossip
 2. Persistent memory document survives process restart
-3. Second node + async gossip on writes
-4. Vector clocks + deduplication
-5. `VIBE_CHECK` consistency mode (multi-node reads)
-6. Argument Protocol for conflict resolution
-7. Compaction (single node first, then gossip the compaction event)
-8. Node personalities
-9. Fun SQL extensions (`EXPLAIN VIBE`, `SHOW CONFLICTS`, `COMPACT MEMORY`, etc.)
-10. `CALL ELECTION`
+3. DDL handling — `CREATE TABLE` updates Schema section and gossips `ddl_change`
+4. Second node + async gossip on writes
+5. Vector clocks + deduplication
+6. `VIBE_CHECK` consistency mode (multi-node reads)
+7. Argument Protocol for conflict resolution
+8. Compaction (single node first, then gossip the compaction event)
+9. Node personalities
+10. Fun SQL extensions (`EXPLAIN VIBE`, `SHOW CONFLICTS`, `COMPACT MEMORY`, etc.)
+11. `CALL ELECTION`
 
 ---
 
