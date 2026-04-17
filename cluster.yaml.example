@@ -1,0 +1,24 @@
+# vibeqlite cluster configuration
+# Copy to cluster.yaml and edit before starting nodes.
+# Each node is started with: uvicorn node.server:app --port <PORT> -- --node-id <ID> --config cluster.yaml
+
+context_budget_tokens: 8192       # total context window of the LLM backend (required)
+compaction_threshold_pct: 80       # trigger compaction at this % of context budget
+gossip_timeout_ms: 2000            # per-peer write gossip timeout (fire-and-forget log)
+ddl_gossip_timeout_ms: 5000        # DDL gossip is synchronous; longer timeout
+llm_model: "llama3.2"              # Ollama model name
+llm_base_url: "http://localhost:11434"  # Ollama base URL
+data_dir: "data"                   # directory for memory doc files ({data_dir}/{node_id}.md)
+
+nodes:
+  - id: saturn
+    url: http://localhost:8001
+    personality: default
+
+  - id: pluton
+    url: http://localhost:8002
+    personality: confident
+
+  - id: neptune
+    url: http://localhost:8003
+    personality: paranoid
