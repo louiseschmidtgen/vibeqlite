@@ -85,6 +85,7 @@ async def client(tmp_path: Path):
     )
     app.state.vector_clock = {"saturn": 0}
     app.state.compaction_count = 0
+    app.state.gossip = None
 
     async with AsyncClient(
         transport=ASGITransport(app=app), base_url="http://test"

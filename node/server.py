@@ -1,8 +1,9 @@
 """
 node/server.py — vibeqlite node HTTP server
 
-Phase 1: POST /query (classify → LLM → update memory), GET /status.
-Phase 2: memory path wired from data_dir config, save() after writes.
+Phase 1: POST /query, GET /status.
+Phase 2: file-backed memory.
+Phase 3: POST /gossip, DDL broadcast.
 Start with: NODE_ID=saturn CONFIG_PATH=cluster.yaml uvicorn node.server:app
 """
 from __future__ import annotations
@@ -18,6 +19,8 @@ import yaml
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
+from cluster.gossip import GossipClient
+from cluster.registry import NodeRegistry
 from node.llm_engine import LLMClient, LLMParseError
 from node.memory import MemoryDoc
 
@@ -58,6 +61,13 @@ async def lifespan(app: FastAPI):
         model=cfg.get("llm_model", "llama3.2"),
         base_url=cfg.get("llm_base_url", "http://localhost:11434"),
     )
+    registry = NodeRegistry(config_path, node_id)
+    app.state.registry = registry
+    app.state.gossip = GossipClient(
+        registry=registry,
+        self_id=node_id,
+        ddl_timeout_ms=cfg.get("ddl_gossip_timeout_ms", 5000),
+    )
     app.state.vector_clock: dict[str, int] = {node_id: 0}
     app.state.compaction_count: int = 0
     yield
@@ -92,6 +102,7 @@ async def query(req: QueryRequest) -> dict[str, Any]:
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
+    peer_acks: dict[str, bool] = {}
     if result.get("memory_doc_updated"):
         if result.get("updated_table_section"):
             m = re.match(r"## Table:\s*(\S+)", result["updated_table_section"].strip())
@@ -101,9 +112,16 @@ async def query(req: QueryRequest) -> dict[str, Any]:
             mem.update_schema_section(result["updated_schema_section"])
         app.state.vector_clock[node_id] = app.state.vector_clock.get(node_id, 0) + 1
         mem.save()
+        if sql_type == "ddl" and result.get("updated_schema_section") and app.state.gossip:
+            peer_acks = await app.state.gossip.broadcast_ddl({
+                "type": "ddl_change",
+                "from": node_id,
+                "vector_clock": app.state.vector_clock,
+                "schema_snapshot": result["updated_schema_section"],
+            })
 
     rows = result.get("rows")
-    return _envelope(
+    envelope = _envelope(
         node_id,
         app.state.vector_clock,
         app.state.compaction_count,
@@ -112,6 +130,9 @@ async def query(req: QueryRequest) -> dict[str, Any]:
         affected_rows=result.get("affected_rows"),
         headers=list(rows[0].keys()) if rows else None,
     )
+    if peer_acks:
+        envelope["peer_acks"] = peer_acks
+    return envelope
 
 
 @app.get("/status")
@@ -127,6 +148,22 @@ async def status() -> dict[str, Any]:
         "token_estimate": tokens,
         "context_usage_pct": round(tokens / budget * 100, 1),
     }
+
+
+@app.post("/gossip")
+async def gossip(msg: dict) -> dict[str, Any]:
+    mem: MemoryDoc = app.state.memory
+    msg_type = msg.get("type", "")
+
+    if msg_type == "ddl_change":
+        schema = msg.get("schema_snapshot", "")
+        if schema:
+            mem.update_schema_section(schema)
+            mem.save()
+        return {"status": "ok", "type": msg_type}
+
+    # Other types stubbed for future phases
+    return {"status": "ok", "type": msg_type}
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
