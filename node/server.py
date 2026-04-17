@@ -4,6 +4,7 @@ node/server.py — vibeqlite node HTTP server
 Phase 1: POST /query, GET /status.
 Phase 2: file-backed memory.
 Phase 3: POST /gossip, DDL broadcast.
+Phase 4: async write gossip fanout.
 Start with: NODE_ID=saturn CONFIG_PATH=cluster.yaml uvicorn node.server:app
 """
 from __future__ import annotations
@@ -119,6 +120,20 @@ async def query(req: QueryRequest) -> dict[str, Any]:
                 "vector_clock": app.state.vector_clock,
                 "schema_snapshot": result["updated_schema_section"],
             })
+        elif sql_type == "write" and app.state.gossip:
+            table_name = ""
+            if result.get("updated_table_section"):
+                m2 = re.match(r"## Table:\s*(\S+)", result["updated_table_section"].strip())
+                if m2:
+                    table_name = m2.group(1)
+            await app.state.gossip.broadcast_write({
+                "type": "write",
+                "from": node_id,
+                "vector_clock": app.state.vector_clock,
+                "statement": req.sql,
+                "table_name": table_name,
+                "summary": result.get("explanation", ""),
+            })
 
     rows = result.get("rows")
     envelope = _envelope(
@@ -161,6 +176,20 @@ async def gossip(msg: dict) -> dict[str, Any]:
             mem.update_schema_section(schema)
             mem.save()
         return {"status": "ok", "type": msg_type}
+
+    if msg_type == "write":
+        llm: LLMClient = app.state.llm
+        task = LLMClient.build_gossip_task(msg)
+        try:
+            result = await llm.call(task=task, memory_doc=mem.get_text())
+        except Exception:
+            return {"status": "ok", "type": msg_type, "merged": False}
+        if result.get("updated_table_section"):
+            m = re.match(r"## Table:\s*(\S+)", result["updated_table_section"].strip())
+            if m:
+                mem.update_table_section(m.group(1), result["updated_table_section"])
+                mem.save()
+        return {"status": "ok", "type": msg_type, "merged": True}
 
     # Other types stubbed for future phases
     return {"status": "ok", "type": msg_type}

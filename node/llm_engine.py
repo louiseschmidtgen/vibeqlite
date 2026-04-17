@@ -3,6 +3,7 @@ node/llm_engine.py — LLMClient
 
 Phase 0: classify_sql.
 Phase 1: async LLM call via Ollama /api/generate.
+Phase 4: build_gossip_task static helper.
 """
 from __future__ import annotations
 
@@ -66,6 +67,20 @@ class LLMClient:
         if "task_type" not in result:
             raise LLMParseError(f"missing task_type: {result}")
         return result
+
+    @staticmethod
+    def build_gossip_task(message: dict) -> str:
+        """Format incoming write gossip message into a TASK string for the prompt."""
+        table = message.get("table_name", "unknown")
+        sql = message.get("statement", "")
+        summary = message.get("summary", "")
+        from_node = message.get("from", "peer")
+        return (
+            f"GOSSIP_MERGE: peer node '{from_node}' executed the following on table '{table}'.\n"
+            f"SQL: {sql}\n"
+            f"Summary: {summary}\n"
+            "Apply the change to your memory document."
+        )
 
     def classify_sql(
         self, sql: str
