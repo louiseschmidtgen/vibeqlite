@@ -1,51 +1,148 @@
 """
 node/server.py — vibeqlite node HTTP server
 
-Phase 0: empty FastAPI app. Routes added in Phase 1+.
+Phase 1: POST /query (classify → LLM → update memory), GET /status.
+Start with: NODE_ID=saturn CONFIG_PATH=cluster.yaml uvicorn node.server:app
 """
 from __future__ import annotations
 
-import argparse
+import os
+import re
 import sys
+from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any
 
 import yaml
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
 
-app = FastAPI(title="vibeqlite node")
-
-# ---------------------------------------------------------------------------
-# Config is loaded at startup via lifespan or direct call from __main__.
-# In Phase 0 it is stored as a module-level dict; Phase 1 replaces this
-# with a proper Config dataclass and app.state.
-# ---------------------------------------------------------------------------
-_config: dict = {}
-_node_id: str = ""
+from node.llm_engine import LLMClient, LLMParseError
+from node.memory import MemoryDoc
 
 
-def load_config(config_path: Path, node_id: str) -> None:
-    global _config, _node_id
-    with open(config_path) as f:
-        _config = yaml.safe_load(f)
-    node_ids = [n["id"] for n in _config.get("nodes", [])]
-    if node_id not in node_ids:
-        print(f"ERROR: node-id '{node_id}' not found in {config_path}", file=sys.stderr)
+# ── startup ──────────────────────────────────────────────────────────────────
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    node_id = os.environ.get("NODE_ID", "").strip()
+    config_path = Path(os.environ.get("CONFIG_PATH", "cluster.yaml"))
+
+    if not node_id:
+        print("ERROR: NODE_ID env var required", file=sys.stderr)
         sys.exit(1)
-    _node_id = node_id
+    if not config_path.exists():
+        print(f"ERROR: config not found: {config_path}", file=sys.stderr)
+        sys.exit(1)
+
+    with open(config_path) as f:
+        cfg = yaml.safe_load(f)
+
+    ids = [n["id"] for n in cfg.get("nodes", [])]
+    if node_id not in ids:
+        print(f"ERROR: node '{node_id}' not in {config_path}", file=sys.stderr)
+        sys.exit(1)
+
+    node_cfg = next(n for n in cfg["nodes"] if n["id"] == node_id)
+
+    app.state.node_id = node_id
+    app.state.cfg = cfg
+    app.state.memory = MemoryDoc(node_id=node_id)
+    app.state.llm = LLMClient(
+        node_id=node_id,
+        personality=node_cfg.get("personality", "default"),
+        model=cfg.get("llm_model", "llama3.2"),
+        base_url=cfg.get("llm_base_url", "http://localhost:11434"),
+    )
+    app.state.vector_clock: dict[str, int] = {node_id: 0}
+    app.state.compaction_count: int = 0
+    yield
 
 
-# Routes added in Phase 1.
-# Phase 0 acceptance: uvicorn starts without import errors, GET /status → 404.
+app = FastAPI(title="vibeqlite node", lifespan=lifespan)
 
 
-if __name__ == "__main__":
-    import uvicorn
+# ── models ────────────────────────────────────────────────────────────────────
 
-    parser = argparse.ArgumentParser(description="vibeqlite node")
-    parser.add_argument("--node-id", required=True)
-    parser.add_argument("--config", default="cluster.yaml")
-    parser.add_argument("--port", type=int, default=8001)
-    args = parser.parse_args()
+class QueryRequest(BaseModel):
+    sql: str
+    consistency: str = "yolo"
 
-    load_config(Path(args.config), args.node_id)
-    uvicorn.run("node.server:app", host="0.0.0.0", port=args.port, reload=False)
+
+# ── routes ────────────────────────────────────────────────────────────────────
+
+@app.post("/query")
+async def query(req: QueryRequest) -> dict[str, Any]:
+    llm: LLMClient = app.state.llm
+    mem: MemoryDoc = app.state.memory
+    node_id: str = app.state.node_id
+
+    sql_type = llm.classify_sql(req.sql)
+    task = f"{sql_type.upper()}: {req.sql}"
+
+    try:
+        result = await llm.call(task=task, memory_doc=mem.get_text())
+    except LLMParseError as exc:
+        return _envelope(node_id, app.state.vector_clock, app.state.compaction_count,
+                         vibe_error=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    if result.get("memory_doc_updated"):
+        if result.get("updated_table_section"):
+            m = re.match(r"## Table:\s*(\S+)", result["updated_table_section"].strip())
+            if m:
+                mem.update_table_section(m.group(1), result["updated_table_section"])
+        if result.get("updated_schema_section"):
+            mem.update_schema_section(result["updated_schema_section"])
+        app.state.vector_clock[node_id] = app.state.vector_clock.get(node_id, 0) + 1
+
+    rows = result.get("rows")
+    return _envelope(
+        node_id,
+        app.state.vector_clock,
+        app.state.compaction_count,
+        confidence=result.get("confidence"),
+        rows=rows,
+        affected_rows=result.get("affected_rows"),
+        headers=list(rows[0].keys()) if rows else None,
+    )
+
+
+@app.get("/status")
+async def status() -> dict[str, Any]:
+    mem: MemoryDoc = app.state.memory
+    cfg = app.state.cfg
+    budget = cfg.get("context_budget_tokens", 8192)
+    tokens = mem.token_estimate()
+    return {
+        "node_id": app.state.node_id,
+        "vector_clock": app.state.vector_clock,
+        "compaction_count": app.state.compaction_count,
+        "token_estimate": tokens,
+        "context_usage_pct": round(tokens / budget * 100, 1),
+    }
+
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+def _envelope(
+    node_id: str,
+    vector_clock: dict,
+    compaction_count: int,
+    confidence: str | None = None,
+    rows: list | None = None,
+    affected_rows: int | None = None,
+    headers: list | None = None,
+    vibe_error: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "node_id": node_id,
+        "vector_clock": vector_clock,
+        "compaction_count": compaction_count,
+        "confidence": confidence,
+        "rows": rows,
+        "affected_rows": affected_rows,
+        "headers": headers,
+        "vibe_error": vibe_error,
+    }
