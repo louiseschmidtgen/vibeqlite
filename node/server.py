@@ -2,6 +2,7 @@
 node/server.py — vibeqlite node HTTP server
 
 Phase 1: POST /query (classify → LLM → update memory), GET /status.
+Phase 2: memory path wired from data_dir config, save() after writes.
 Start with: NODE_ID=saturn CONFIG_PATH=cluster.yaml uvicorn node.server:app
 """
 from __future__ import annotations
@@ -45,9 +46,12 @@ async def lifespan(app: FastAPI):
 
     node_cfg = next(n for n in cfg["nodes"] if n["id"] == node_id)
 
+    data_dir = Path(cfg.get("data_dir", "data"))
+    mem_path = data_dir / f"{node_id}.md"
+
     app.state.node_id = node_id
     app.state.cfg = cfg
-    app.state.memory = MemoryDoc(node_id=node_id)
+    app.state.memory = MemoryDoc(node_id=node_id, path=mem_path)
     app.state.llm = LLMClient(
         node_id=node_id,
         personality=node_cfg.get("personality", "default"),
@@ -96,6 +100,7 @@ async def query(req: QueryRequest) -> dict[str, Any]:
         if result.get("updated_schema_section"):
             mem.update_schema_section(result["updated_schema_section"])
         app.state.vector_clock[node_id] = app.state.vector_clock.get(node_id, 0) + 1
+        mem.save()
 
     rows = result.get("rows")
     return _envelope(

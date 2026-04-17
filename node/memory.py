@@ -2,10 +2,11 @@
 node/memory.py — MemoryDoc
 
 Phase 1: in-memory document with section update helpers.
-Phase 2 adds file-backed persistence.
+Phase 2: atomic file-backed persistence.
 """
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 
@@ -53,6 +54,15 @@ class MemoryDoc:
             self._text = pattern.sub(new_section, self._text)
         else:
             self._text = self._text.rstrip("\n") + "\n\n" + new_section + "\n"
+
+    def save(self) -> None:
+        """Atomically persist to self.path (write .tmp then rename)."""
+        if self.path is None:
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(".tmp")
+        tmp.write_text(self._text, encoding="utf-8")
+        os.replace(tmp, self.path)
 
     def token_estimate(self, model: str = "gpt-3.5-turbo") -> int:
         try:
