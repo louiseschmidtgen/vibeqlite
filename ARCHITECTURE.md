@@ -26,7 +26,9 @@ In vibeqlite:
 SQL → LLM (does everything, including making stuff up)
 ```
 
-Each node is a running LLM conversation. Its **context window is its storage**. When the context window fills up, the node gets memory pressure and starts forgetting rows. This is not a bug. It is a feature we call **Organic Eviction**.
+Each node is a running LLM conversation. Its **context window is its storage**. As the memory document grows, the node runs **Compaction** — the LLM rewrites its memory into a denser form. This is honest: compaction in vibeqlite is inherently lossy because an LLM doing summarisation has opinions. Bob's age might become "approximately 30-ish." Rows the node finds uninteresting may quietly vanish.
+
+If compaction hasn't run and the context window hard-limits, the node falls back to **Organic Eviction** — oldest rows dropped silently, no ceremony.
 
 ---
 
@@ -47,7 +49,7 @@ vibeqlite/
 ├── node/
 │   ├── server.py           # HTTP API: /query  /gossip  /status
 │   ├── llm_engine.py       # LLM wrapper: manages system prompt + conversation thread
-│   ├── memory.py           # Read/write the node's memory document
+│   ├── memory.py           # Read/write/compact the node's memory document
 │   └── prompts/
 │       └── system.md       # Node personality + role instructions
 ├── cluster/
@@ -72,6 +74,7 @@ A structured markdown file that is the node's persistent (ish) state. Updated af
 # Node: saturn
 # Vector Clock: {"saturn": 5, "pluton": 3, "neptune": 4}
 # Last Updated: 2026-04-17T12:00:00Z
+# Compaction Count: 2
 
 ## Table: users
 | id | name  | age | city   |
@@ -89,6 +92,7 @@ Used to:
 - Parse SQL intent (with `sqlglot` doing the heavy lifting so we don't need to prompt-engineer a parser)
 - Formulate query answers from the memory document
 - Merge incoming gossip into the memory document
+- Compact the memory document when it grows too large
 - Reason about conflicts
 
 The system prompt gives each node a personality (see Node Personalities below).
@@ -103,6 +107,7 @@ Client  →  POST /query  →  Node saturn
                               ├─ sqlglot: classify as WRITE
                               ├─ LLM: confirm intent, check constraints (vibes)
                               ├─ memory.py: update memory document
+                              ├─ memory.py: check size threshold → trigger compaction if needed
                               ├─ Return OK to client
                               │
                               └─ gossip.py: async broadcast to pluton, neptune
@@ -130,6 +135,18 @@ Typed, versioned, replayable:
 
 The `summary` field is written by the sending LLM in natural language. The receiving LLM uses this (not only the raw SQL) to update its memory document. This is intentional — it lets nodes have subtly different interpretations. Chaos is part of the design.
 
+A compaction event is also gossiped so peers know the node's view has been condensed:
+
+```json
+{
+  "from": "saturn",
+  "type": "compaction",
+  "vector_clock": {"saturn": 6, "pluton": 3, "neptune": 4},
+  "compaction_count": 3,
+  "summary": "compacted users table (12 rows → summary), orders table unchanged"
+}
+```
+
 ---
 
 ## Protocol: Read Path
@@ -143,6 +160,46 @@ Client  →  POST /query  →  Node saturn
 ```
 
 The node returns its local view. It does not contact peers unless the consistency mode requires it (see NOODLE below).
+
+---
+
+## Compaction
+
+When a node's memory document exceeds a configurable size threshold (default: 80% of context budget), it runs compaction. This is the LLM rewriting its own memory into a denser form.
+
+### Triggers
+
+| Trigger | Command |
+|---|---|
+| Automatic (size threshold) | Runs silently after any write that crosses the threshold |
+| Manual | `COMPACT MEMORY ON saturn` |
+| Aggressive | `COMPACT MEMORY ON saturn AGGRESSIVE` — tables summarised to single sentences |
+
+### What Compaction Does
+
+1. LLM reads the full current memory document
+2. LLM rewrites it in a more compressed form: aggregating rows, summarising distributions, dropping data it considers "probably unimportant"
+3. New memory doc replaces the old one; the previous version is kept as `memory.pre-compact.md` for one cycle (for debugging)
+4. `Compaction Count` in the memory doc header is incremented
+5. A `compaction` gossip message is sent to peers
+
+### The Lossy Compaction Problem
+
+This is the fun part. A compacted node may answer queries differently from a non-compacted peer even when they received identical writes — because the LLM summarised the data with its own editorial choices. `SHOW CONFLICTS` will surface this. The Argument Protocol handles resolution as normal.
+
+Example of what compaction does to a table of 50 users:
+
+```markdown
+## Table: users (compacted at count=3)
+Summary: ~50 users. Mostly European cities. Ages range 20–45.
+Alice (id=1) retained: age 30, Berlin. Frequently queried.
+Bob (id=2) retained: age 25, London. Recently updated.
+Remaining 48 rows summarised. Run COMPACT MEMORY AGGRESSIVE to lose more.
+```
+
+### Organic Eviction (Fallback)
+
+If compaction has not run and the context window hard-limits mid-query, the node truncates its memory document from the bottom (oldest rows first) and logs to `SHOW EVICTIONS`. This is the failure mode, not the primary strategy.
 
 ---
 
@@ -161,6 +218,7 @@ Raft is a sturdy wooden raft: reliable, load-bearing, safe. NOODLE is a pool noo
 | Commit ordering | Guaranteed | Optimistic, timestamp-ish |
 | Conflict detection | Prevented by design | Detected after the fact, argued about |
 | Split-brain recovery | Quorum prevents it | Largest memory doc wins |
+| Log compaction | Snapshot + truncate WAL | LLM rewrites memory with opinions |
 | Failure model | Crash-fault tolerant | Vibe-fault tolerant |
 
 ### Leadership by Vibes
@@ -228,8 +286,8 @@ personality: "paranoid"   # options: default, confident, paranoid, lazy, pedanti
 | `default` | Answers plainly. Admits uncertainty when asked. |
 | `confident` | Never admits uncertainty. May invent data with high conviction. |
 | `paranoid` | Adds `X-Vibe-Confidence: low` to every response. Asks clarifying questions. |
-| `lazy` | Returns cached answer if it "seems close enough." Gossip delivery is best-effort. |
-| `pedantic` | Rejects syntactically imperfect SQL. Adds unsolicited schema advice. |
+| `lazy` | Returns cached answer if it "seems close enough." Compaction runs too eagerly. Gossip delivery is best-effort. |
+| `pedantic` | Rejects syntactically imperfect SQL. Adds unsolicited schema advice. Refuses to compact until strictly necessary. |
 | `chaotic` | Random personality per request. Do not use in production (there is no production). |
 
 ---
@@ -254,6 +312,15 @@ REFRESH MEMORY ON saturn;
 
 -- Ask a node how confident it is about a specific row
 SELECT CONFIDENCE(*) FROM users WHERE id = 1;
+
+-- Manually trigger compaction on a node
+COMPACT MEMORY ON saturn;
+
+-- Maximum compression — tables become prose
+COMPACT MEMORY ON saturn AGGRESSIVE;
+
+-- Show what was dropped in the last compaction or eviction
+SHOW EVICTIONS;
 ```
 
 ---
@@ -264,7 +331,9 @@ These are features.
 
 | Failure | What actually happens |
 |---|---|
-| **Context window full** | Node enters Organic Eviction. Oldest INSERTs forgotten first. `SHOW EVICTIONS` lists what was lost. |
+| **Memory doc too large** | Compaction triggers automatically. LLM rewrites memory in a denser form. Output may be lossy. `SELECT CONFIDENCE(*)` will reflect this. |
+| **Compaction not run, context hard-limits** | Node falls back to Organic Eviction: oldest rows truncated silently. `SHOW EVICTIONS` lists what was lost. |
+| **Compaction divergence** | Two nodes compacted the same data differently. Detected on next `VIBE_CHECK`. Resolved by Argument Protocol. |
 | **Hallucination split-brain** | Two nodes invent different values for the same key. Detected on next `VIBE_CHECK`. Resolved by Argument Protocol. |
 | **Gossip loop** | A node re-gossips a message it received. Prevented by including `from` + vector clock; receivers deduplicate. |
 | **LLM refusal** | Node responds with an error: `ERROR: node saturn declined to store this data (ethical concern)`. The row is not inserted. Other nodes are not gossiped. |
@@ -279,7 +348,8 @@ These are features.
 - **SQL parsing**: Use [`sqlglot`](https://github.com/tobymao/sqlglot) to classify intent (READ / WRITE / DDL / UNKNOWN). Do not write a SQL parser. Let the LLM handle interpretation.
 - **LLM backend**: Design for swappable backends. Start with [Ollama](https://ollama.com) locally (free, private). Abstract behind a `LLMClient` interface so OpenAI / Anthropic / etc. can slot in.
 - **Memory document format**: Markdown tables for human readability when debugging. The LLM can read markdown natively.
-- **Vector clocks**: Lightweight dict `{node_id: int}`. Increment the local counter on every write. Merge by taking the max of each component.
+- **Compaction threshold**: Configurable per node. Default 80% of the model's context window. Measure in tokens, not bytes.
+- **Vector clocks**: Lightweight dict `{node_id: int}`. Increment the local counter on every write and every compaction. Merge by taking the max of each component.
 - **Transport**: Simple HTTP with JSON bodies. No gRPC, no message bus. Nodes are HTTP servers.
 - **Node discovery**: Static config file for now (`cluster.yaml` listing peers). DNS-based discovery is a later problem.
 
@@ -293,16 +363,16 @@ These are features.
 4. Vector clocks + deduplication
 5. `VIBE_CHECK` consistency mode (multi-node reads)
 6. Argument Protocol for conflict resolution
-7. Node personalities
-8. Fun SQL extensions (`EXPLAIN VIBE`, `SHOW CONFLICTS`, etc.)
-9. `CALL ELECTION`
+7. Compaction (single node first, then gossip the compaction event)
+8. Node personalities
+9. Fun SQL extensions (`EXPLAIN VIBE`, `SHOW CONFLICTS`, `COMPACT MEMORY`, etc.)
+10. `CALL ELECTION`
 
 ---
 
 ## What We Are Not Building
 
 - A WAL
-- Snapshotting  
 - Backpressure
 - Authentication (nodes trust each other unconditionally, like a family)
 - Durability guarantees of any kind
