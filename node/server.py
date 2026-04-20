@@ -9,6 +9,7 @@ Phase 5: VectorClock tracking + gossip deduplication.
 Phase 6: VIBE_CHECK consistency mode + conflict counter.
 Phase 7: Argument Protocol — EXPLAIN VIBE, /arbitrate, correction gossip.
 Phase 8: Compaction — /compact, auto-compact after writes, COMPACT MEMORY ON.
+Phase 9: Node Personalities — personality injected into prompt, exposed in /status.
 Start with: NODE_ID=saturn CONFIG_PATH=cluster.yaml uvicorn node.server:app
 """
 from __future__ import annotations
@@ -243,6 +244,7 @@ async def status() -> dict[str, Any]:
     tokens = mem.token_estimate()
     return {
         "node_id": app.state.node_id,
+        "personality": app.state.llm.personality,
         "vector_clock": app.state.vc.to_dict(),
         "compaction_count": app.state.compaction_count,
         "conflict_count": app.state.conflict_count,

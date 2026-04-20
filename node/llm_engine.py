@@ -6,6 +6,7 @@ Phase 1: async LLM call via Ollama /api/generate.
 Phase 4: build_gossip_task static helper.
 Phase 7: build_explain_task, build_arbitrate_task, build_correction_task.
 Phase 8: build_compaction_task.
+Phase 9: _load_personality_block — injects full personality prose into prompt.
 """
 from __future__ import annotations
 
@@ -38,12 +39,34 @@ class LLMClient:
         self.model = model
         self.base_url = base_url.rstrip("/")
         self._system_template: str = _SYSTEM_PROMPT_PATH.read_text()
+        self._personality_block: str = self._load_personality_block(
+            self._system_template, personality
+        )
+
+    @staticmethod
+    def _load_personality_block(system_md: str, personality: str) -> str:
+        """Extract the prose block for `personality` from the ## Personality Inserts
+        section of system.md. Falls back to 'default' if the name is not found."""
+        section_m = re.search(
+            r"## Personality Inserts\n([\s\S]*?)(?:\n---\s*\n|\Z)", system_md
+        )
+        if not section_m:
+            return personality
+        section = section_m.group(1)
+
+        def _extract(name: str) -> str | None:
+            m = re.search(
+                rf"### `{re.escape(name)}`\n```\n([\s\S]*?)```", section
+            )
+            return m.group(1).strip() if m else None
+
+        return _extract(personality) or _extract("default") or personality
 
     def _build_prompt(self, memory_doc: str, task: str) -> str:
         return (
             self._system_template
             .replace("{NODE_ID}", self.node_id)
-            .replace("{PERSONALITY}", self.personality)
+            .replace("{PERSONALITY}", self._personality_block)
             .replace("{MEMORY_DOC}", memory_doc)
             .replace("{TASK}", task)
         )
