@@ -86,6 +86,7 @@ async def client(tmp_path: Path):
     )
     app.state.vc = VectorClock("saturn", initial={"saturn": 0})
     app.state.compaction_count = 0
+    app.state.conflict_count = 0
     app.state.gossip = None
 
     async with AsyncClient(

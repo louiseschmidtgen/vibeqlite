@@ -4,6 +4,7 @@ cluster/gossip.py — GossipClient
 Phase 3: DDL broadcast (synchronous, awaits all peers).
 Phase 4: write broadcast (fire-and-forget).
 Phase 5: deduplication via seen-set; attach clock to outgoing messages.
+Phase 6: broadcast_read() for VIBE_CHECK fan-out.
 """
 from __future__ import annotations
 
@@ -70,3 +71,32 @@ class GossipClient:
         peers = self.registry.peers()
         for peer in peers:
             asyncio.create_task(self._post_gossip(peer, message))
+
+    async def broadcast_read(self, sql: str, timeout_ms: int = 2000) -> list[dict]:
+        """Fan out a read query to all peers and collect responses (Phase 6).
+
+        Peers are called with ?internal=true so they skip gossip fanout.
+        Non-responding peers are excluded (Timeout-Based Exclusion).
+        Returns a list of response dicts (one per responding peer).
+        """
+        timeout = timeout_ms / 1000.0
+        peers = self.registry.peers()
+
+        async def _query_peer(node: NodeConfig) -> dict | None:
+            try:
+                async with httpx.AsyncClient(timeout=timeout) as client:
+                    resp = await client.post(
+                        f"{node.url}/query",
+                        params={"internal": "true"},
+                        json={"sql": sql, "consistency": "yolo"},
+                    )
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        data["_from_node"] = node.id
+                        return data
+            except Exception as exc:
+                log.warning("vibe_check read from %s failed: %s", node.id, exc)
+            return None
+
+        results = await asyncio.gather(*[_query_peer(p) for p in peers])
+        return [r for r in results if r is not None]

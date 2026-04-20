@@ -46,6 +46,7 @@ async def client():
     app.state.llm = LLMClient("saturn", "default", "llama3.2", "http://localhost:11434")
     app.state.vc = VectorClock("saturn", initial={"saturn": 0})
     app.state.compaction_count = 0
+    app.state.conflict_count = 0
     app.state.gossip = None
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
         yield c

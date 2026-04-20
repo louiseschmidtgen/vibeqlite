@@ -6,19 +6,22 @@ Phase 2: file-backed memory.
 Phase 3: POST /gossip, DDL broadcast.
 Phase 4: async write gossip fanout.
 Phase 5: VectorClock tracking + gossip deduplication.
+Phase 6: VIBE_CHECK consistency mode + conflict counter.
 Start with: NODE_ID=saturn CONFIG_PATH=cluster.yaml uvicorn node.server:app
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import sys
 from contextlib import asynccontextmanager
+from math import floor
 from pathlib import Path
 from typing import Any
 
 import yaml
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 
 from cluster.clock import VectorClock
@@ -74,6 +77,7 @@ async def lifespan(app: FastAPI):
     mem = app.state.memory
     app.state.vc = VectorClock(node_id, initial=mem._vector_clock)
     app.state.compaction_count: int = 0
+    app.state.conflict_count: int = 0
     yield
 
 
@@ -90,10 +94,17 @@ class QueryRequest(BaseModel):
 # ── routes ────────────────────────────────────────────────────────────────────
 
 @app.post("/query")
-async def query(req: QueryRequest) -> dict[str, Any]:
+async def query(
+    req: QueryRequest,
+    internal: bool = Query(default=False),
+) -> dict[str, Any]:
     llm: LLMClient = app.state.llm
     mem: MemoryDoc = app.state.memory
     node_id: str = app.state.node_id
+
+    # ── VIBE_CHECK fan-out (only on non-internal calls) ───────────────────
+    if req.consistency == "vibe_check" and not internal:
+        return await _vibe_check(req.sql, node_id, llm, mem)
 
     sql_type = llm.classify_sql(req.sql)
     task = f"{sql_type.upper()}: {req.sql}"
@@ -117,14 +128,14 @@ async def query(req: QueryRequest) -> dict[str, Any]:
         clock = app.state.vc.tick()
         mem.update_clock(clock)
         mem.save()
-        if sql_type == "ddl" and result.get("updated_schema_section") and app.state.gossip:
+        if sql_type == "ddl" and result.get("updated_schema_section") and app.state.gossip and not internal:
             peer_acks = await app.state.gossip.broadcast_ddl({
                 "type": "ddl_change",
                 "from": node_id,
                 "vector_clock": clock,
                 "schema_snapshot": result["updated_schema_section"],
             })
-        elif sql_type == "write" and app.state.gossip:
+        elif sql_type == "write" and app.state.gossip and not internal:
             table_name = ""
             if result.get("updated_table_section"):
                 m2 = re.match(r"## Table:\s*(\S+)", result["updated_table_section"].strip())
@@ -164,6 +175,7 @@ async def status() -> dict[str, Any]:
         "node_id": app.state.node_id,
         "vector_clock": app.state.vc.to_dict(),
         "compaction_count": app.state.compaction_count,
+        "conflict_count": app.state.conflict_count,
         "token_estimate": tokens,
         "context_usage_pct": round(tokens / budget * 100, 1),
     }
@@ -208,6 +220,80 @@ async def gossip(msg: dict) -> dict[str, Any]:
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
+
+async def _vibe_check(
+    sql: str,
+    node_id: str,
+    llm: LLMClient,
+    mem: MemoryDoc,
+) -> dict[str, Any]:
+    """Fan out to all peers + self, pick majority, track conflicts."""
+    # Self answer
+    sql_type = llm.classify_sql(sql)
+    task = f"{sql_type.upper()}: {sql}"
+    self_rows: list | None = None
+    try:
+        self_result = await llm.call(task=task, memory_doc=mem.get_text())
+        self_rows = self_result.get("rows")
+    except Exception:
+        pass
+
+    self_response: dict[str, Any] = {
+        "_from_node": node_id,
+        "rows": self_rows,
+        "vector_clock": app.state.vc.to_dict(),
+    }
+
+    # Peer answers
+    peer_responses: list[dict] = []
+    if app.state.gossip:
+        cfg = app.state.cfg
+        peer_responses = await app.state.gossip.broadcast_read(
+            sql,
+            timeout_ms=cfg.get("gossip_timeout_ms", 2000),
+        )
+
+    all_responses = [self_response] + peer_responses
+    n = len(all_responses)
+    majority_threshold = floor(n / 2) + 1
+
+    # Group by normalised rows content
+    groups: dict[str, list[dict]] = {}
+    for resp in all_responses:
+        key = json.dumps(resp.get("rows"), sort_keys=True, default=str)
+        groups.setdefault(key, []).append(resp)
+
+    # Find winning group
+    winning_key = max(groups, key=lambda k: len(groups[k]))
+    winning_group = groups[winning_key]
+    minority_groups = [g for k, g in groups.items() if k != winning_key]
+    minority_responses = [r for g in minority_groups for r in g]
+
+    if len(winning_group) < majority_threshold:
+        # No majority — pure split
+        return _envelope(
+            node_id,
+            app.state.vc.to_dict(),
+            app.state.compaction_count,
+            vibe_error={"type": "NO_MAJORITY", "all_responses": all_responses},
+        )
+
+    envelope = _envelope(
+        node_id,
+        app.state.vc.to_dict(),
+        app.state.compaction_count,
+        rows=winning_group[0].get("rows"),
+        headers=list(winning_group[0]["rows"][0].keys()) if winning_group[0].get("rows") else None,
+    )
+
+    if minority_responses:
+        app.state.conflict_count += 1
+        envelope["vibe_error"] = {
+            "type": "CONFLICT",
+            "minority_responses": minority_responses,
+        }
+
+    return envelope
 
 def _envelope(
     node_id: str,
