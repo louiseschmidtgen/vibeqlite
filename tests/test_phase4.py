@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+from cluster.clock import VectorClock
 from node.llm_engine import LLMClient
 from node.memory import MemoryDoc
 from node.server import app
@@ -43,7 +44,7 @@ async def client():
     app.state.memory = MemoryDoc(node_id="saturn")
     app.state.memory.update_schema_section("## Schema\n- users: id INTEGER, name TEXT")
     app.state.llm = LLMClient("saturn", "default", "llama3.2", "http://localhost:11434")
-    app.state.vector_clock = {"saturn": 0}
+    app.state.vc = VectorClock("saturn", initial={"saturn": 0})
     app.state.compaction_count = 0
     app.state.gossip = None
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:

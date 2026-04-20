@@ -8,12 +8,13 @@ import pytest
 import yaml
 from httpx import ASGITransport, AsyncClient
 
+from cluster.clock import VectorClock
 from node.llm_engine import LLMClient
 from node.memory import MemoryDoc
 from node.server import app
 
 
-# ── MemoryDoc unit tests ─────────────────────────────────────────────
+# ── MemoryDoc unit tests ──────────────────────────────────────────────────────────────────
 
 def test_blank_doc_contains_schema():
     mem = MemoryDoc("saturn")
@@ -57,7 +58,7 @@ def test_token_estimate_nonzero():
     assert mem.token_estimate() > 0
 
 
-# ── server integration tests (mocked LLM) ──────────────────────────────────
+# ── server integration tests (mocked LLM) ────────────────────────────────────────────
 
 @pytest.fixture()
 async def client(tmp_path: Path):
@@ -83,7 +84,7 @@ async def client(tmp_path: Path):
         model="llama3.2",
         base_url="http://localhost:11434",
     )
-    app.state.vector_clock = {"saturn": 0}
+    app.state.vc = VectorClock("saturn", initial={"saturn": 0})
     app.state.compaction_count = 0
     app.state.gossip = None
 

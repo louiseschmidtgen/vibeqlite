@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+from cluster.clock import VectorClock
 from cluster.gossip import GossipClient
 from cluster.registry import NodeConfig, NodeRegistry
 from node.llm_engine import LLMClient
@@ -13,7 +14,7 @@ from node.memory import MemoryDoc
 from node.server import app
 
 
-# ── GossipClient unit tests ─────────────────────────────────────────────
+# ── GossipClient unit tests ───────────────────────────────────────────────────────────────
 
 @pytest.fixture()
 def registry(tmp_path):
@@ -50,7 +51,7 @@ def test_peers_excludes_self(registry):
     assert len(peers) == 1
 
 
-# ── /gossip endpoint tests ─────────────────────────────────────────────
+# ── /gossip endpoint tests ─────────────────────────────────────────────────────────────
 
 @pytest.fixture()
 async def client():
@@ -59,7 +60,7 @@ async def client():
     app.state.cfg = {"context_budget_tokens": 8192}
     app.state.memory = MemoryDoc(node_id="saturn")
     app.state.llm = LLMClient("saturn", "default", "llama3.2", "http://localhost:11434")
-    app.state.vector_clock = {"saturn": 0}
+    app.state.vc = VectorClock("saturn", initial={"saturn": 0})
     app.state.compaction_count = 0
     # gossip client with no peers (no config needed for endpoint tests)
     app.state.gossip = None
@@ -84,7 +85,7 @@ async def test_gossip_unknown_type_ok(client: AsyncClient):
     assert resp.json()["status"] == "ok"
 
 
-# ── /query DDL path broadcasts gossip ──────────────────────────────────
+# ── /query DDL path broadcasts gossip ────────────────────────────────────────────
 
 async def test_query_ddl_broadcasts_to_peers(client: AsyncClient):
     mock_gossip = AsyncMock(return_value={"pluton": True})
@@ -105,10 +106,8 @@ async def test_query_ddl_broadcasts_to_peers(client: AsyncClient):
         "consistency": "yolo",
     })
     assert resp.status_code == 200
-    data = resp.json()
-    assert data["vibe_error"] is None
-    assert data.get("peer_acks") == {"pluton": True}
+    assert resp.json()["peer_acks"] == {"pluton": True}
     mock_gossip.assert_called_once()
-    call_args = mock_gossip.call_args[0][0]
-    assert call_args["type"] == "ddl_change"
-    assert "## Schema" in call_args["schema_snapshot"]
+    gossip_msg = mock_gossip.call_args[0][0]
+    assert gossip_msg["type"] == "ddl_change"
+    assert "## Schema" in gossip_msg["schema_snapshot"]

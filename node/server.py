@@ -5,6 +5,7 @@ Phase 1: POST /query, GET /status.
 Phase 2: file-backed memory.
 Phase 3: POST /gossip, DDL broadcast.
 Phase 4: async write gossip fanout.
+Phase 5: VectorClock tracking + gossip deduplication.
 Start with: NODE_ID=saturn CONFIG_PATH=cluster.yaml uvicorn node.server:app
 """
 from __future__ import annotations
@@ -20,6 +21,7 @@ import yaml
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
+from cluster.clock import VectorClock
 from cluster.gossip import GossipClient
 from cluster.registry import NodeRegistry
 from node.llm_engine import LLMClient, LLMParseError
@@ -69,7 +71,8 @@ async def lifespan(app: FastAPI):
         self_id=node_id,
         ddl_timeout_ms=cfg.get("ddl_gossip_timeout_ms", 5000),
     )
-    app.state.vector_clock: dict[str, int] = {node_id: 0}
+    mem = app.state.memory
+    app.state.vc = VectorClock(node_id, initial=mem._vector_clock)
     app.state.compaction_count: int = 0
     yield
 
@@ -98,7 +101,7 @@ async def query(req: QueryRequest) -> dict[str, Any]:
     try:
         result = await llm.call(task=task, memory_doc=mem.get_text())
     except LLMParseError as exc:
-        return _envelope(node_id, app.state.vector_clock, app.state.compaction_count,
+        return _envelope(node_id, app.state.vc.to_dict(), app.state.compaction_count,
                          vibe_error=str(exc))
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -111,13 +114,14 @@ async def query(req: QueryRequest) -> dict[str, Any]:
                 mem.update_table_section(m.group(1), result["updated_table_section"])
         if result.get("updated_schema_section"):
             mem.update_schema_section(result["updated_schema_section"])
-        app.state.vector_clock[node_id] = app.state.vector_clock.get(node_id, 0) + 1
+        clock = app.state.vc.tick()
+        mem.update_clock(clock)
         mem.save()
         if sql_type == "ddl" and result.get("updated_schema_section") and app.state.gossip:
             peer_acks = await app.state.gossip.broadcast_ddl({
                 "type": "ddl_change",
                 "from": node_id,
-                "vector_clock": app.state.vector_clock,
+                "vector_clock": clock,
                 "schema_snapshot": result["updated_schema_section"],
             })
         elif sql_type == "write" and app.state.gossip:
@@ -129,7 +133,7 @@ async def query(req: QueryRequest) -> dict[str, Any]:
             await app.state.gossip.broadcast_write({
                 "type": "write",
                 "from": node_id,
-                "vector_clock": app.state.vector_clock,
+                "vector_clock": clock,
                 "statement": req.sql,
                 "table_name": table_name,
                 "summary": result.get("explanation", ""),
@@ -138,7 +142,7 @@ async def query(req: QueryRequest) -> dict[str, Any]:
     rows = result.get("rows")
     envelope = _envelope(
         node_id,
-        app.state.vector_clock,
+        app.state.vc.to_dict(),
         app.state.compaction_count,
         confidence=result.get("confidence"),
         rows=rows,
@@ -158,7 +162,7 @@ async def status() -> dict[str, Any]:
     tokens = mem.token_estimate()
     return {
         "node_id": app.state.node_id,
-        "vector_clock": app.state.vector_clock,
+        "vector_clock": app.state.vc.to_dict(),
         "compaction_count": app.state.compaction_count,
         "token_estimate": tokens,
         "context_usage_pct": round(tokens / budget * 100, 1),
@@ -169,6 +173,14 @@ async def status() -> dict[str, Any]:
 async def gossip(msg: dict) -> dict[str, Any]:
     mem: MemoryDoc = app.state.memory
     msg_type = msg.get("type", "")
+
+    # Deduplicate replayed messages
+    if app.state.gossip and app.state.gossip.check_and_mark_seen(msg):
+        return {"status": "ok", "type": msg_type, "duplicate": True}
+
+    # Merge incoming clock
+    if msg.get("vector_clock"):
+        app.state.vc.merge(msg["vector_clock"])
 
     if msg_type == "ddl_change":
         schema = msg.get("schema_snapshot", "")

@@ -3,9 +3,11 @@ node/memory.py — MemoryDoc
 
 Phase 1: in-memory document with section update helpers.
 Phase 2: atomic file-backed persistence.
+Phase 5: vector clock stored in header.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 from pathlib import Path
@@ -31,6 +33,26 @@ class MemoryDoc:
             self._text = path.read_text()
         else:
             self._text = _blank_doc(node_id)
+        self._vector_clock: dict[str, int] = self._parse_clock()
+
+    def _parse_clock(self) -> dict[str, int]:
+        """Extract vector clock dict from the memory doc header."""
+        m = re.search(r"# Vector Clock: (\{[^}]*\})", self._text)
+        if m:
+            try:
+                return json.loads(m.group(1))
+            except (json.JSONDecodeError, ValueError):
+                pass
+        return {}
+
+    def update_clock(self, clock: dict[str, int]) -> None:
+        """Merge incoming clock into header (take max per component)."""
+        merged: dict[str, int] = dict(self._vector_clock)
+        for k, v in clock.items():
+            merged[k] = max(merged.get(k, 0), v)
+        self._vector_clock = merged
+        new_header = f"# Vector Clock: {json.dumps(self._vector_clock, sort_keys=True)}"
+        self._text = re.sub(r"# Vector Clock: \{[^}]*\}", new_header, self._text)
 
     def get_text(self) -> str:
         return self._text

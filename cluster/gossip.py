@@ -3,10 +3,12 @@ cluster/gossip.py — GossipClient
 
 Phase 3: DDL broadcast (synchronous, awaits all peers).
 Phase 4: write broadcast (fire-and-forget).
+Phase 5: deduplication via seen-set; attach clock to outgoing messages.
 """
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 
 import httpx
@@ -27,6 +29,22 @@ class GossipClient:
         self.registry = registry
         self.self_id = self_id
         self._ddl_timeout = ddl_timeout_ms / 1000.0
+        self._seen: set[str] = set()
+
+    def _msg_key(self, message: dict) -> str:
+        """Stable key for dedup: '{from}:{sorted-clock-json}'."""
+        from_node = message.get("from", "")
+        clock = message.get("vector_clock", {})
+        clock_str = json.dumps(clock, sort_keys=True)
+        return f"{from_node}:{clock_str}"
+
+    def check_and_mark_seen(self, message: dict) -> bool:
+        """Return True if this message is a duplicate. Mark as seen if not."""
+        key = self._msg_key(message)
+        if key in self._seen:
+            return True
+        self._seen.add(key)
+        return False
 
     async def _post_gossip(self, node: NodeConfig, message: dict) -> bool:
         """POST gossip to one peer. Returns True on 200."""
