@@ -4,6 +4,7 @@ node/llm_engine.py — LLMClient
 Phase 0: classify_sql.
 Phase 1: async LLM call via Ollama /api/generate.
 Phase 4: build_gossip_task static helper.
+Phase 7: build_explain_task, build_arbitrate_task, build_correction_task.
 """
 from __future__ import annotations
 
@@ -80,6 +81,45 @@ class LLMClient:
             f"SQL: {sql}\n"
             f"Summary: {summary}\n"
             "Apply the change to your memory document."
+        )
+
+    @staticmethod
+    def build_explain_task(sql: str) -> str:
+        """Build an EXPLAIN VIBE task for the Argument Protocol (Phase 7)."""
+        return (
+            f"EXPLAIN VIBE: A consistency check detected that nodes disagree on the "
+            f"answer to this query. Explain, based on your memory document, exactly "
+            f"what your answer is and why.\n"
+            f"SQL: {sql}\n"
+            "Respond with JSON: task_type='explain', explanation (string describing "
+            "your reasoning), rows (list of answer rows), memory_doc_updated=false."
+        )
+
+    @staticmethod
+    def build_arbitrate_task(sql: str, explanation_a: str, explanation_b: str) -> str:
+        """Build an ARBITRATE task to pick a winner between two node explanations."""
+        return (
+            f"ARBITRATE: Two nodes in a distributed database disagree on the answer "
+            f"to a query. Pick the winner based on the explanations provided.\n"
+            f"SQL: {sql}\n"
+            f"--- Node A explanation ---\n{explanation_a}\n"
+            f"--- Node B explanation ---\n{explanation_b}\n"
+            "Respond with JSON: task_type='arbitrate', winner ('A' or 'B'), "
+            "explanation (your reasoning), rows (the correct answer rows list), "
+            "memory_doc_updated=false."
+        )
+
+    @staticmethod
+    def build_correction_task(sql: str, winning_rows: list) -> str:
+        """Build a CORRECTION task for a node that held the wrong answer."""
+        rows_json = json.dumps(winning_rows, indent=2)
+        return (
+            f"CORRECTION: Cluster consensus determined the correct answer to a query "
+            f"differs from what you believe. Update your memory document.\n"
+            f"SQL: {sql}\n"
+            f"Correct rows:\n{rows_json}\n"
+            "Respond with JSON: task_type='correction', memory_doc_updated=true, "
+            "updated_table_section (the corrected ## Table: section as a markdown string)."
         )
 
     def classify_sql(

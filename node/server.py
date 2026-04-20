@@ -7,10 +7,12 @@ Phase 3: POST /gossip, DDL broadcast.
 Phase 4: async write gossip fanout.
 Phase 5: VectorClock tracking + gossip deduplication.
 Phase 6: VIBE_CHECK consistency mode + conflict counter.
+Phase 7: Argument Protocol — EXPLAIN VIBE, /arbitrate, correction gossip.
 Start with: NODE_ID=saturn CONFIG_PATH=cluster.yaml uvicorn node.server:app
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -20,6 +22,7 @@ from math import floor
 from pathlib import Path
 from typing import Any
 
+import httpx
 import yaml
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
@@ -78,6 +81,7 @@ async def lifespan(app: FastAPI):
     app.state.vc = VectorClock(node_id, initial=mem._vector_clock)
     app.state.compaction_count: int = 0
     app.state.conflict_count: int = 0
+    app.state._arbiter_idx: int = 0
     yield
 
 
@@ -91,6 +95,12 @@ class QueryRequest(BaseModel):
     consistency: str = "yolo"
 
 
+class ArbitrateRequest(BaseModel):
+    sql: str
+    explanation_a: str
+    explanation_b: str
+
+
 # ── routes ────────────────────────────────────────────────────────────────────
 
 @app.post("/query")
@@ -101,6 +111,25 @@ async def query(
     llm: LLMClient = app.state.llm
     mem: MemoryDoc = app.state.memory
     node_id: str = app.state.node_id
+
+    # ── EXPLAIN VIBE: return LLM explanation for the Argument Protocol ────
+    if req.sql.upper().startswith("EXPLAIN VIBE"):
+        original_sql = req.sql[len("EXPLAIN VIBE"):].strip()
+        task = LLMClient.build_explain_task(original_sql)
+        try:
+            result = await llm.call(task=task, memory_doc=mem.get_text())
+        except LLMParseError as exc:
+            return _envelope(node_id, app.state.vc.to_dict(), app.state.compaction_count,
+                             vibe_error=str(exc))
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        return _envelope(
+            node_id,
+            app.state.vc.to_dict(),
+            app.state.compaction_count,
+            confidence=result.get("confidence"),
+            rows=result.get("rows"),
+        )
 
     # ── VIBE_CHECK fan-out (only on non-internal calls) ───────────────────
     if req.consistency == "vibe_check" and not internal:
@@ -215,11 +244,167 @@ async def gossip(msg: dict) -> dict[str, Any]:
                 mem.save()
         return {"status": "ok", "type": msg_type, "merged": True}
 
+    if msg_type == "correction":
+        winning_rows = msg.get("winning_rows")
+        sql = msg.get("sql", "")
+        if winning_rows is not None:
+            llm: LLMClient = app.state.llm
+            task = LLMClient.build_correction_task(sql, winning_rows)
+            try:
+                result = await llm.call(task=task, memory_doc=mem.get_text())
+            except Exception:
+                return {"status": "ok", "type": msg_type, "corrected": False}
+            if result.get("updated_table_section"):
+                m = re.match(r"## Table:\s*(\S+)", result["updated_table_section"].strip())
+                if m:
+                    mem.update_table_section(m.group(1), result["updated_table_section"])
+                    mem.save()
+            return {"status": "ok", "type": msg_type, "corrected": True}
+        return {"status": "ok", "type": msg_type, "corrected": False}
+
     # Other types stubbed for future phases
     return {"status": "ok", "type": msg_type}
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
+
+@app.post("/arbitrate")
+async def arbitrate(req: ArbitrateRequest) -> dict[str, Any]:
+    """Phase 7: Arbiter endpoint — pick winner between two node explanations."""
+    llm: LLMClient = app.state.llm
+    mem: MemoryDoc = app.state.memory
+    node_id: str = app.state.node_id
+    task = LLMClient.build_arbitrate_task(req.sql, req.explanation_a, req.explanation_b)
+    try:
+        result = await llm.call(task=task, memory_doc=mem.get_text())
+    except LLMParseError as exc:
+        return {"node_id": node_id, "winner": "A", "explanation": str(exc), "rows": None}
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {
+        "node_id": node_id,
+        "winner": result.get("winner", "A"),
+        "explanation": result.get("explanation", ""),
+        "rows": result.get("rows"),
+    }
+
+
+async def argument_protocol(
+    sql: str,
+    majority_rows: list | None,
+    minority_responses: list[dict],
+    node_id: str,
+    llm: LLMClient,
+    mem: MemoryDoc,
+) -> dict[str, Any]:
+    """Phase 7: Argument Protocol — arbitrate conflicts, correct losing nodes."""
+    registry = app.state.registry
+    timeout = app.state.cfg.get("gossip_timeout_ms", 2000) / 1000.0
+    minority_ids = {r["_from_node"] for r in minority_responses}
+
+    # Step 1: Self explanation
+    self_explanation = ""
+    try:
+        self_result = await llm.call(
+            task=LLMClient.build_explain_task(sql),
+            memory_doc=mem.get_text(),
+        )
+        self_explanation = self_result.get("explanation", "")
+    except Exception:
+        pass
+
+    # Step 2: Minority explanation (first minority node only, internal call)
+    minority_explanation = ""
+    for minority_resp in minority_responses:
+        minority_node_id = minority_resp["_from_node"]
+        node_cfg = registry.get(minority_node_id)
+        if node_cfg:
+            try:
+                async with httpx.AsyncClient(timeout=timeout) as client:
+                    resp = await client.post(
+                        f"{node_cfg.url}/query",
+                        params={"internal": "true"},
+                        json={"sql": f"EXPLAIN VIBE {sql}", "consistency": "yolo"},
+                    )
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        rows = data.get("rows") or []
+                        minority_explanation = (
+                            rows[0].get("explanation", "") if rows else ""
+                        )
+            except Exception:
+                pass
+        break  # use only the first minority node
+
+    # Step 3: Pick arbiter (round-robin, excluding minority nodes)
+    eligible = [n for n in registry.peers() if n.id not in minority_ids]
+    arbiter_url: str | None = None
+    if eligible:
+        idx = getattr(app.state, "_arbiter_idx", 0)
+        arbiter_url = eligible[idx % len(eligible)].url
+        app.state._arbiter_idx = (idx + 1) % len(eligible)
+
+    # Step 4: Arbitrate (via arbiter node or self)
+    winning_rows = majority_rows
+    if arbiter_url:
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                resp = await client.post(
+                    f"{arbiter_url}/arbitrate",
+                    json={
+                        "sql": sql,
+                        "explanation_a": self_explanation,
+                        "explanation_b": minority_explanation,
+                    },
+                )
+                if resp.status_code == 200:
+                    arb_data = resp.json()
+                    if arb_data.get("winner") == "B":
+                        winning_rows = arb_data.get("rows", majority_rows)
+        except Exception:
+            pass
+    else:
+        # Self-arbitrate
+        try:
+            arb_result = await llm.call(
+                task=LLMClient.build_arbitrate_task(sql, self_explanation, minority_explanation),
+                memory_doc=mem.get_text(),
+            )
+            if arb_result.get("winner") == "B":
+                winning_rows = arb_result.get("rows", majority_rows)
+        except Exception:
+            pass
+
+    # Step 5: Send correction gossip to losing minority nodes
+    gossip = app.state.gossip
+    if gossip:
+        for minority_resp in minority_responses:
+            minority_node_id = minority_resp["_from_node"]
+            node_cfg = registry.get(minority_node_id)
+            if node_cfg:
+                asyncio.create_task(gossip._post_gossip(node_cfg, {
+                    "type": "correction",
+                    "from": node_id,
+                    "vector_clock": app.state.vc.to_dict(),
+                    "sql": sql,
+                    "winning_rows": winning_rows,
+                }))
+
+    # Step 6: Return result
+    envelope = _envelope(
+        node_id,
+        app.state.vc.to_dict(),
+        app.state.compaction_count,
+        rows=winning_rows,
+        headers=list(winning_rows[0].keys()) if winning_rows else None,
+    )
+    envelope["vibe_error"] = {
+        "type": "CONFLICT",
+        "resolution": "argument_protocol",
+        "minority_nodes": list(minority_ids),
+    }
+    return envelope
+
 
 async def _vibe_check(
     sql: str,
@@ -288,6 +473,10 @@ async def _vibe_check(
 
     if minority_responses:
         app.state.conflict_count += 1
+        if getattr(app.state, "registry", None) is not None:
+            return await argument_protocol(
+                sql, winning_group[0].get("rows"), minority_responses, node_id, llm, mem
+            )
         envelope["vibe_error"] = {
             "type": "CONFLICT",
             "minority_responses": minority_responses,
