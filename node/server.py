@@ -8,6 +8,7 @@ Phase 4: async write gossip fanout.
 Phase 5: VectorClock tracking + gossip deduplication.
 Phase 6: VIBE_CHECK consistency mode + conflict counter.
 Phase 7: Argument Protocol — EXPLAIN VIBE, /arbitrate, correction gossip.
+Phase 8: Compaction — /compact, auto-compact after writes, COMPACT MEMORY ON.
 Start with: NODE_ID=saturn CONFIG_PATH=cluster.yaml uvicorn node.server:app
 """
 from __future__ import annotations
@@ -101,6 +102,10 @@ class ArbitrateRequest(BaseModel):
     explanation_b: str
 
 
+class CompactRequest(BaseModel):
+    aggressive: bool = False
+
+
 # ── routes ────────────────────────────────────────────────────────────────────
 
 @app.post("/query")
@@ -111,6 +116,33 @@ async def query(
     llm: LLMClient = app.state.llm
     mem: MemoryDoc = app.state.memory
     node_id: str = app.state.node_id
+
+    # ── COMPACT MEMORY ON <node> command ───────────────────────────────
+    compact_match = re.match(
+        r"COMPACT\s+MEMORY\s+ON\s+(\S+)(\s+AGGRESSIVE)?\s*$",
+        req.sql.strip(),
+        re.IGNORECASE,
+    )
+    if compact_match:
+        target_id = compact_match.group(1)
+        aggressive = compact_match.group(2) is not None
+        registry = getattr(app.state, "registry", None)
+        if target_id == node_id:
+            # Compact self
+            new_count = await _run_compaction(llm, mem, node_id, aggressive)
+            return _envelope(node_id, app.state.vc.to_dict(), new_count)
+        node_cfg = registry.get(target_id) if registry else None
+        if node_cfg is None:
+            raise HTTPException(status_code=404, detail=f"node '{target_id}' not found")
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.post(
+                    f"{node_cfg.url}/compact",
+                    json={"aggressive": aggressive},
+                )
+            return resp.json()
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     # ── EXPLAIN VIBE: return LLM explanation for the Argument Protocol ────
     if req.sql.upper().startswith("EXPLAIN VIBE"):
@@ -191,6 +223,15 @@ async def query(
     )
     if peer_acks:
         envelope["peer_acks"] = peer_acks
+
+    # ── Auto-compact after writes that updated memory ──────────────────────
+    if sql_type in ("write", "ddl") and result.get("memory_doc_updated"):
+        cfg = app.state.cfg
+        budget = cfg.get("context_budget_tokens", 8192)
+        threshold_pct = cfg.get("compaction_threshold_pct", 80.0)
+        if mem.needs_compaction(budget, threshold_pct):
+            asyncio.create_task(_auto_compact(llm, mem, node_id))
+
     return envelope
 
 
@@ -262,11 +303,58 @@ async def gossip(msg: dict) -> dict[str, Any]:
             return {"status": "ok", "type": msg_type, "corrected": True}
         return {"status": "ok", "type": msg_type, "corrected": False}
 
+    if msg_type == "compaction":
+        # Peers receive a notification only — no memory change
+        return {"status": "ok", "type": msg_type, "noted": True}
+
     # Other types stubbed for future phases
     return {"status": "ok", "type": msg_type}
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
+
+@app.post("/compact")
+async def compact(req: CompactRequest) -> dict[str, Any]:
+    """Phase 8: Trigger compaction on this node."""
+    llm: LLMClient = app.state.llm
+    mem: MemoryDoc = app.state.memory
+    node_id: str = app.state.node_id
+    new_count = await _run_compaction(llm, mem, node_id, req.aggressive)
+    return _envelope(node_id, app.state.vc.to_dict(), new_count)
+
+
+async def _run_compaction(
+    llm: LLMClient, mem: MemoryDoc, node_id: str, aggressive: bool = False
+) -> int:
+    """Run compaction: backup, LLM compact, update sections, gossip."""
+    mem.backup_pre_compact()
+    task = LLMClient.build_compaction_task(aggressive)
+    try:
+        result = await llm.call(task=task, memory_doc=mem.get_text())
+    except Exception:
+        return app.state.compaction_count
+    for section in result.get("compacted_sections") or []:
+        table_name = section.get("table_name", "")
+        updated = section.get("updated_table_section", "")
+        if table_name and updated:
+            mem.update_table_section(table_name, updated)
+    new_count = mem.increment_compaction_count()
+    mem.save()
+    app.state.compaction_count = new_count
+    if app.state.gossip:
+        await app.state.gossip.broadcast_compaction({
+            "type": "compaction",
+            "from": node_id,
+            "vector_clock": app.state.vc.to_dict(),
+            "compaction_count": new_count,
+        })
+    return new_count
+
+
+async def _auto_compact(llm: LLMClient, mem: MemoryDoc, node_id: str) -> None:
+    """Background auto-compact triggered after a write crosses the threshold."""
+    await _run_compaction(llm, mem, node_id, aggressive=False)
+
 
 @app.post("/arbitrate")
 async def arbitrate(req: ArbitrateRequest) -> dict[str, Any]:

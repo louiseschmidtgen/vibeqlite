@@ -5,6 +5,7 @@ Phase 0: classify_sql.
 Phase 1: async LLM call via Ollama /api/generate.
 Phase 4: build_gossip_task static helper.
 Phase 7: build_explain_task, build_arbitrate_task, build_correction_task.
+Phase 8: build_compaction_task.
 """
 from __future__ import annotations
 
@@ -120,6 +121,19 @@ class LLMClient:
             f"Correct rows:\n{rows_json}\n"
             "Respond with JSON: task_type='correction', memory_doc_updated=true, "
             "updated_table_section (the corrected ## Table: section as a markdown string)."
+        )
+
+    @staticmethod
+    def build_compaction_task(aggressive: bool = False) -> str:
+        """Build a COMPACT MEMORY task (Phase 8)."""
+        mode = "AGGRESSIVE " if aggressive else ""
+        return (
+            f"COMPACT MEMORY {mode}: Your memory document is getting large. "
+            "Summarise each ## Table: section to keep only the most recent and "
+            "relevant rows. Remove duplicates and obsolete entries. "
+            "Keep the ## Schema section intact.\n"
+            "Respond with JSON: task_type='compaction', memory_doc_updated=true, "
+            "compacted_sections (list of {table_name, updated_table_section} objects)."
         )
 
     def classify_sql(

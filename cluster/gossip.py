@@ -5,6 +5,7 @@ Phase 3: DDL broadcast (synchronous, awaits all peers).
 Phase 4: write broadcast (fire-and-forget).
 Phase 5: deduplication via seen-set; attach clock to outgoing messages.
 Phase 6: broadcast_read() for VIBE_CHECK fan-out.
+Phase 8: broadcast_compaction() fire-and-forget notification.
 """
 from __future__ import annotations
 
@@ -100,3 +101,9 @@ class GossipClient:
 
         results = await asyncio.gather(*[_query_peer(p) for p in peers])
         return [r for r in results if r is not None]
+
+    async def broadcast_compaction(self, message: dict) -> None:
+        """Fire-and-forget compaction notification to all peers (Phase 8)."""
+        peers = self.registry.peers()
+        for peer in peers:
+            asyncio.create_task(self._post_gossip(peer, message))

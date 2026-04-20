@@ -4,6 +4,7 @@ node/memory.py — MemoryDoc
 Phase 1: in-memory document with section update helpers.
 Phase 2: atomic file-backed persistence.
 Phase 5: vector clock stored in header.
+Phase 8: compaction threshold check, backup, count tracking.
 """
 from __future__ import annotations
 
@@ -93,3 +94,34 @@ class MemoryDoc:
             return len(enc.encode(self._text))
         except Exception:
             return len(self._text) // 4
+
+    def needs_compaction(self, budget_tokens: int, threshold_pct: float = 80.0) -> bool:
+        """Return True when token usage exceeds threshold_pct of budget."""
+        return self.token_estimate() >= (budget_tokens * threshold_pct / 100)
+
+    def backup_pre_compact(self) -> None:
+        """Copy current doc to data/{node_id}.pre-compact.md."""
+        if self.path is None:
+            return
+        backup = self.path.parent / f"{self.node_id}.pre-compact.md"
+        backup.write_text(self._text, encoding="utf-8")
+
+    def increment_compaction_count(self) -> int:
+        """Bump the Compaction Count header and return the new value."""
+        m = re.search(r"# Compaction Count: (\d+)", self._text)
+        count = int(m.group(1)) + 1 if m else 1
+        if m:
+            self._text = re.sub(
+                r"# Compaction Count: \d+",
+                f"# Compaction Count: {count}",
+                self._text,
+            )
+        else:
+            # Insert after node header line
+            self._text = re.sub(
+                r"(# Node: [^\n]+\n)",
+                rf"\1# Compaction Count: {count}\n",
+                self._text,
+                count=1,
+            )
+        return count
