@@ -58,6 +58,68 @@ CALL ELECTION;
 
 ---
 
+## Quickstart
+
+**Prerequisites**: Python 3.11+, [Ollama](https://ollama.com) running locally with a model pulled (default: `llama3.2`).
+
+```bash
+# 1. Install
+git clone https://github.com/louiseschmidtgen/vibeqlite
+cd vibeqlite
+pip install -e .
+
+# 2. Configure
+cp cluster.yaml.example cluster.yaml
+mkdir -p data
+
+# 3. Start nodes (each in its own terminal)
+NODE_ID=saturn  CONFIG_PATH=cluster.yaml uvicorn node.server:app --port 8001
+NODE_ID=pluton  CONFIG_PATH=cluster.yaml uvicorn node.server:app --port 8002
+NODE_ID=neptune CONFIG_PATH=cluster.yaml uvicorn node.server:app --port 8003
+
+# 4. Open the REPL (connects to saturn by default)
+python -m cli.vibeqlite
+# or point at any node:
+python -m cli.vibeqlite --url http://localhost:8002
+```
+
+### REPL quick reference
+
+```sql
+-- write data
+INSERT INTO users (name, age) VALUES ('Alice', 30);
+
+-- read with majority consensus
+SET CONSISTENCY = 'vibe_check';
+SELECT * FROM users;
+
+-- cluster introspection
+SELECT * FROM vibe_nodes;
+SHOW CONFLICTS;
+SHOW SCHEMA;
+
+-- confidence check on a specific row
+SELECT CONFIDENCE(*) FROM users WHERE id = 1;
+
+-- trigger an election (longest campaign speech wins)
+CALL ELECTION;
+
+-- compact a node's memory
+COMPACT MEMORY ON saturn;
+
+-- exit
+\q
+```
+
+### Run tests
+
+```bash
+python -m pytest          # all 128 tests
+python -m pytest tests/test_phase11.py -v   # Phase 11 only
+```
+
+---
+
 ## Architecture
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the full design, component breakdown, and honest list of failure modes.
@@ -66,4 +128,4 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full design, component breakdown,
 
 ## Status
 
-Pre-alpha. The nodes are still figuring themselves out.
+All 11 phases complete. 128 tests passing.
