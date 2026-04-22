@@ -6,6 +6,7 @@ Phase 4: write broadcast (fire-and-forget).
 Phase 5: deduplication via seen-set; attach clock to outgoing messages.
 Phase 6: broadcast_read() for VIBE_CHECK fan-out.
 Phase 8: broadcast_compaction() fire-and-forget notification.
+Phase 11: broadcast_election(), announce_winner().
 """
 from __future__ import annotations
 
@@ -104,6 +105,32 @@ class GossipClient:
 
     async def broadcast_compaction(self, message: dict) -> None:
         """Fire-and-forget compaction notification to all peers (Phase 8)."""
+        peers = self.registry.peers()
+        for peer in peers:
+            asyncio.create_task(self._post_gossip(peer, message))
+
+    async def broadcast_election(self, timeout_ms: int = 2000) -> list[dict]:
+        """POST /election to all peers and collect their campaign cases (Phase 11)."""
+        timeout = timeout_ms / 1000.0
+        peers = self.registry.peers()
+
+        async def _call_peer(node: NodeConfig) -> dict | None:
+            try:
+                async with httpx.AsyncClient(timeout=timeout) as client:
+                    resp = await client.post(f"{node.url}/election")
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        data["_from_node"] = node.id
+                        return data
+            except Exception as exc:
+                log.warning("election call to %s failed: %s", node.id, exc)
+            return None
+
+        results = await asyncio.gather(*[_call_peer(p) for p in peers])
+        return [r for r in results if r is not None]
+
+    async def announce_winner(self, message: dict) -> None:
+        """Fire-and-forget election_result announcement to all peers (Phase 11)."""
         peers = self.registry.peers()
         for peer in peers:
             asyncio.create_task(self._post_gossip(peer, message))

@@ -12,6 +12,7 @@ Phase 8: Compaction — /compact, auto-compact after writes, COMPACT MEMORY ON.
 Phase 9: Node Personalities — personality injected into prompt, exposed in /status.
 Phase 10: Fun SQL Extensions — SELECT * FROM vibe_nodes, SHOW CONFLICTS/SCHEMA/EVICTIONS,
          REFRESH MEMORY ON, SELECT CONFIDENCE(*), /refresh endpoint.
+Phase 11: CALL ELECTION — nodes campaign, winner announced via election_result gossip.
 Start with: NODE_ID=saturn CONFIG_PATH=cluster.yaml uvicorn node.server:app
 """
 from __future__ import annotations
@@ -86,6 +87,7 @@ async def lifespan(app: FastAPI):
     app.state.compaction_count: int = 0
     app.state.conflict_count: int = 0
     app.state._arbiter_idx: int = 0
+    app.state.is_leader: bool = False
     yield
 
 
@@ -146,6 +148,10 @@ async def query(
             return resp.json()
         except Exception as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    # ── Phase 11: CALL ELECTION ─────────────────────────────────────────────
+    if re.match(r"CALL\s+ELECTION\s*$", req.sql.strip(), re.IGNORECASE):
+        return await _call_election(llm, mem, node_id)
 
     # ── Phase 10 fun SQL extensions ─────────────────────────────────────────
     if re.match(r"SELECT\s+\*\s+FROM\s+vibe_nodes\s*$", req.sql.strip(), re.IGNORECASE):
@@ -281,6 +287,7 @@ async def status() -> dict[str, Any]:
         "conflict_count": app.state.conflict_count,
         "token_estimate": tokens,
         "context_usage_pct": round(tokens / budget * 100, 1),
+        "is_leader": getattr(app.state, "is_leader", False),
     }
 
 
@@ -340,6 +347,11 @@ async def gossip(msg: dict) -> dict[str, Any]:
         # Peers receive a notification only — no memory change
         return {"status": "ok", "type": msg_type, "noted": True}
 
+    if msg_type == "election_result":
+        winner = msg.get("winner")
+        app.state.is_leader = winner == app.state.node_id
+        return {"status": "ok", "type": msg_type, "winner": winner}
+
     # Other types stubbed for future phases
     return {"status": "ok", "type": msg_type}
 
@@ -387,6 +399,86 @@ async def _run_compaction(
 async def _auto_compact(llm: LLMClient, mem: MemoryDoc, node_id: str) -> None:
     """Background auto-compact triggered after a write crosses the threshold."""
     await _run_compaction(llm, mem, node_id, aggressive=False)
+
+
+@app.post("/election")
+async def election_endpoint() -> dict[str, Any]:
+    """Phase 11: Return this node's election campaign case."""
+    llm: LLMClient = app.state.llm
+    mem: MemoryDoc = app.state.memory
+    node_id: str = app.state.node_id
+    task = LLMClient.build_election_task()
+    try:
+        result = await llm.call(task=task, memory_doc=mem.get_text())
+    except LLMParseError as exc:
+        return {"node_id": node_id, "task_type": "election", "case": str(exc), "candidate": node_id}
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {
+        "node_id": node_id,
+        "task_type": result.get("task_type", "election"),
+        "case": result.get("case", ""),
+        "candidate": result.get("candidate", node_id),
+    }
+
+
+async def _call_election(llm: LLMClient, mem: MemoryDoc, node_id: str) -> dict[str, Any]:
+    """Run cluster election: collect cases, pick winner, announce (Phase 11)."""
+    cfg = app.state.cfg
+
+    # Self case
+    self_case = ""
+    try:
+        result = await llm.call(task=LLMClient.build_election_task(), memory_doc=mem.get_text())
+        self_case = result.get("case", "")
+    except Exception:
+        pass
+
+    all_cases: list[dict] = [{"node_id": node_id, "case": self_case}]
+
+    # Collect peer cases
+    gossip = app.state.gossip
+    if gossip:
+        timeout_ms = cfg.get("gossip_timeout_ms", 2000)
+        peer_responses = await gossip.broadcast_election(timeout_ms=timeout_ms)
+        for p in peer_responses:
+            all_cases.append({
+                "node_id": p.get("_from_node", p.get("node_id", "?")),
+                "case": p.get("case", ""),
+            })
+
+    # Pick winner: longest case, tie-break alphabetical node_id
+    def _score(entry: dict) -> tuple:
+        return (-len(entry.get("case", "")), entry.get("node_id", ""))
+
+    winner_entry = min(all_cases, key=_score)
+    winner_id = winner_entry["node_id"]
+
+    # Set own leader flag
+    app.state.is_leader = winner_id == node_id
+
+    # Announce result to peers (fire-and-forget)
+    if gossip:
+        asyncio.create_task(gossip.announce_winner({
+            "type": "election_result",
+            "from": node_id,
+            "winner": winner_id,
+            "vector_clock": app.state.vc.to_dict(),
+        }))
+
+    rows = [
+        {"node_id": e["node_id"], "winner": e["node_id"] == winner_id, "case": e["case"]}
+        for e in all_cases
+    ]
+    envelope = _envelope(
+        node_id,
+        app.state.vc.to_dict(),
+        app.state.compaction_count,
+        rows=rows,
+        headers=["node_id", "winner", "case"],
+    )
+    envelope["winner"] = winner_id
+    return envelope
 
 
 @app.post("/refresh")

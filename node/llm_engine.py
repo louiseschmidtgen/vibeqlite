@@ -8,6 +8,7 @@ Phase 7: build_explain_task, build_arbitrate_task, build_correction_task.
 Phase 8: build_compaction_task.
 Phase 9: _load_personality_block — injects full personality prose into prompt.
 Phase 10: build_confidence_task.
+Phase 11: build_election_task.
 """
 from __future__ import annotations
 
@@ -169,6 +170,16 @@ class LLMClient:
             "Respond with JSON: task_type='confidence_check', "
             "confidence ('high'|'medium'|'low'), rows (the matching row(s) from memory), "
             "explanation (one sentence), memory_doc_updated=false."
+        )
+
+    @staticmethod
+    def build_election_task() -> str:
+        """Build an ELECTION task (Phase 11)."""
+        return (
+            "ELECTION: You are a candidate for cluster leader. Make your case for why "
+            "you should be elected.\n"
+            "Respond with JSON: task_type='election', candidate (your node id), "
+            "case (a compelling paragraph explaining why you should lead this cluster)."
         )
 
     def classify_sql(
