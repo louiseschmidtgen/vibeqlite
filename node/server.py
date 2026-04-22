@@ -10,6 +10,8 @@ Phase 6: VIBE_CHECK consistency mode + conflict counter.
 Phase 7: Argument Protocol — EXPLAIN VIBE, /arbitrate, correction gossip.
 Phase 8: Compaction — /compact, auto-compact after writes, COMPACT MEMORY ON.
 Phase 9: Node Personalities — personality injected into prompt, exposed in /status.
+Phase 10: Fun SQL Extensions — SELECT * FROM vibe_nodes, SHOW CONFLICTS/SCHEMA/EVICTIONS,
+         REFRESH MEMORY ON, SELECT CONFIDENCE(*), /refresh endpoint.
 Start with: NODE_ID=saturn CONFIG_PATH=cluster.yaml uvicorn node.server:app
 """
 from __future__ import annotations
@@ -144,6 +146,35 @@ async def query(
             return resp.json()
         except Exception as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    # ── Phase 10 fun SQL extensions ─────────────────────────────────────────
+    if re.match(r"SELECT\s+\*\s+FROM\s+vibe_nodes\s*$", req.sql.strip(), re.IGNORECASE):
+        return await _select_vibe_nodes(node_id)
+
+    if re.match(r"SHOW\s+CONFLICTS\s*$", req.sql.strip(), re.IGNORECASE):
+        return _show_conflicts(node_id)
+
+    if re.match(r"SHOW\s+SCHEMA\s*$", req.sql.strip(), re.IGNORECASE):
+        return _show_schema(node_id, mem)
+
+    if re.match(r"SHOW\s+EVICTIONS\s*$", req.sql.strip(), re.IGNORECASE):
+        return _show_evictions(node_id)
+
+    refresh_match = re.match(
+        r"REFRESH\s+MEMORY\s+ON\s+(\S+)\s*$", req.sql.strip(), re.IGNORECASE
+    )
+    if refresh_match:
+        return await _refresh_memory_on(refresh_match.group(1), node_id)
+
+    confidence_match = re.match(
+        r"SELECT\s+CONFIDENCE\(\*\)\s+FROM\s+(\S+)\s+WHERE\s+id\s*=\s*(\S+)\s*$",
+        req.sql.strip(),
+        re.IGNORECASE,
+    )
+    if confidence_match:
+        return await _select_confidence(
+            llm, mem, node_id, confidence_match.group(1), confidence_match.group(2)
+        )
 
     # ── EXPLAIN VIBE: return LLM explanation for the Argument Protocol ────
     if req.sql.upper().startswith("EXPLAIN VIBE"):
@@ -356,6 +387,143 @@ async def _run_compaction(
 async def _auto_compact(llm: LLMClient, mem: MemoryDoc, node_id: str) -> None:
     """Background auto-compact triggered after a write crosses the threshold."""
     await _run_compaction(llm, mem, node_id, aggressive=False)
+
+
+@app.post("/refresh")
+async def refresh_memory() -> dict[str, Any]:
+    """Phase 10: Reload memory document from disk."""
+    mem: MemoryDoc = app.state.memory
+    node_id: str = app.state.node_id
+    mem.reload()
+    return {"node_id": node_id, "status": "refreshed", "token_estimate": mem.token_estimate()}
+
+
+async def _select_vibe_nodes(node_id: str) -> dict[str, Any]:
+    """Fan out GET /status to all nodes and return as rows (Phase 10)."""
+    mem: MemoryDoc = app.state.memory
+    cfg = app.state.cfg
+    budget = cfg.get("context_budget_tokens", 8192)
+    tokens = mem.token_estimate()
+    self_row = {
+        "node_id": node_id,
+        "personality": app.state.llm.personality,
+        "token_estimate": tokens,
+        "context_usage_pct": round(tokens / budget * 100, 1),
+        "conflict_count": app.state.conflict_count,
+        "compaction_count": app.state.compaction_count,
+        "vector_clock": json.dumps(app.state.vc.to_dict(), sort_keys=True),
+    }
+    rows = [self_row]
+    registry = getattr(app.state, "registry", None)
+    if registry:
+        timeout = cfg.get("gossip_timeout_ms", 2000) / 1000.0
+
+        async def _get_peer_status(node: Any) -> dict | None:
+            try:
+                async with httpx.AsyncClient(timeout=timeout) as client:
+                    resp = await client.get(f"{node.url}/status")
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        data["vector_clock"] = json.dumps(
+                            data.get("vector_clock", {}), sort_keys=True
+                        )
+                        return data
+            except Exception:
+                pass
+            return None
+
+        results = await asyncio.gather(*[_get_peer_status(p) for p in registry.peers()])
+        rows.extend(r for r in results if r is not None)
+
+    return _envelope(
+        node_id,
+        app.state.vc.to_dict(),
+        app.state.compaction_count,
+        rows=rows,
+        headers=list(rows[0].keys()),
+    )
+
+
+def _show_conflicts(node_id: str) -> dict[str, Any]:
+    """Return conflict count (Phase 10)."""
+    return _envelope(
+        node_id,
+        app.state.vc.to_dict(),
+        app.state.compaction_count,
+        rows=[{"conflict_count": app.state.conflict_count}],
+        headers=["conflict_count"],
+    )
+
+
+def _show_schema(node_id: str, mem: MemoryDoc) -> dict[str, Any]:
+    """Return the ## Schema section from memory doc (Phase 10)."""
+    m = re.search(r"## Schema\n([\s\S]*?)(?=\n##|\Z)", mem.get_text())
+    schema_text = m.group(1).strip() if m else "(no schema)"
+    return _envelope(
+        node_id,
+        app.state.vc.to_dict(),
+        app.state.compaction_count,
+        rows=[{"schema": schema_text}],
+        headers=["schema"],
+    )
+
+
+def _show_evictions(node_id: str) -> dict[str, Any]:
+    """Return eviction log — stub (Phase 10)."""
+    return _envelope(
+        node_id,
+        app.state.vc.to_dict(),
+        app.state.compaction_count,
+        rows=[{"evictions": "(eviction log not yet implemented)"}],
+        headers=["evictions"],
+    )
+
+
+async def _refresh_memory_on(target_id: str, node_id: str) -> dict[str, Any]:
+    """Reload memory on self or forward to a peer (Phase 10)."""
+    if target_id == node_id:
+        mem: MemoryDoc = app.state.memory
+        mem.reload()
+        return _envelope(
+            node_id,
+            app.state.vc.to_dict(),
+            app.state.compaction_count,
+            rows=[{"status": "refreshed", "token_estimate": mem.token_estimate()}],
+            headers=["status", "token_estimate"],
+        )
+    registry = getattr(app.state, "registry", None)
+    node_cfg = registry.get(target_id) if registry else None
+    if node_cfg is None:
+        raise HTTPException(status_code=404, detail=f"node '{target_id}' not found")
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(f"{node_cfg.url}/refresh")
+        return resp.json()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+async def _select_confidence(
+    llm: LLMClient, mem: MemoryDoc, node_id: str, table: str, row_id: str
+) -> dict[str, Any]:
+    """Run a CONFIDENCE CHECK via LLM (Phase 10)."""
+    task = LLMClient.build_confidence_task(table, row_id)
+    try:
+        result = await llm.call(task=task, memory_doc=mem.get_text())
+    except LLMParseError as exc:
+        return _envelope(
+            node_id, app.state.vc.to_dict(), app.state.compaction_count, vibe_error=str(exc)
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return _envelope(
+        node_id,
+        app.state.vc.to_dict(),
+        app.state.compaction_count,
+        confidence=result.get("confidence"),
+        rows=result.get("rows"),
+        headers=list(result["rows"][0].keys()) if result.get("rows") else None,
+    )
 
 
 @app.post("/arbitrate")

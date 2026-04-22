@@ -7,6 +7,7 @@ Phase 4: build_gossip_task static helper.
 Phase 7: build_explain_task, build_arbitrate_task, build_correction_task.
 Phase 8: build_compaction_task.
 Phase 9: _load_personality_block — injects full personality prose into prompt.
+Phase 10: build_confidence_task.
 """
 from __future__ import annotations
 
@@ -157,6 +158,17 @@ class LLMClient:
             "Keep the ## Schema section intact.\n"
             "Respond with JSON: task_type='compaction', memory_doc_updated=true, "
             "compacted_sections (list of {table_name, updated_table_section} objects)."
+        )
+
+    @staticmethod
+    def build_confidence_task(table: str, row_id: str) -> str:
+        """Build a CONFIDENCE CHECK task (Phase 10)."""
+        return (
+            f"CONFIDENCE CHECK: How confident are you about the data for "
+            f"the row with id={row_id} in table '{table}'?\n"
+            "Respond with JSON: task_type='confidence_check', "
+            "confidence ('high'|'medium'|'low'), rows (the matching row(s) from memory), "
+            "explanation (one sentence), memory_doc_updated=false."
         )
 
     def classify_sql(

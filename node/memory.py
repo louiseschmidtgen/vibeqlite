@@ -5,6 +5,7 @@ Phase 1: in-memory document with section update helpers.
 Phase 2: atomic file-backed persistence.
 Phase 5: vector clock stored in header.
 Phase 8: compaction threshold check, backup, count tracking.
+Phase 10: reload() for REFRESH MEMORY ON command.
 """
 from __future__ import annotations
 
@@ -105,6 +106,12 @@ class MemoryDoc:
             return
         backup = self.path.parent / f"{self.node_id}.pre-compact.md"
         backup.write_text(self._text, encoding="utf-8")
+
+    def reload(self) -> None:
+        """Reload text from disk (Phase 10: REFRESH MEMORY ON command)."""
+        if self.path and self.path.exists():
+            self._text = self.path.read_text()
+            self._vector_clock = self._parse_clock()
 
     def increment_compaction_count(self) -> int:
         """Bump the Compaction Count header and return the new value."""
