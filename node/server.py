@@ -74,6 +74,7 @@ async def lifespan(app: FastAPI):
         personality=node_cfg.get("personality", "default"),
         model=cfg.get("llm_model", "llama3.2"),
         base_url=cfg.get("llm_base_url", "http://localhost:11434"),
+        timeout=float(cfg.get("llm_timeout_s", 120)),
     )
     registry = NodeRegistry(config_path, node_id)
     app.state.registry = registry

@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environment
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# vibeqlite runtime
+cluster.yaml
+data/
+*.bak
+
+# OS
+.DS_Store
+Thumbs.db

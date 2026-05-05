@@ -35,11 +35,13 @@ class LLMClient:
         personality: str,
         model: str,
         base_url: str,
+        timeout: float = 120.0,
     ) -> None:
         self.node_id = node_id
         self.personality = personality
         self.model = model
         self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
         self._system_template: str = _SYSTEM_PROMPT_PATH.read_text()
         self._personality_block: str = self._load_personality_block(
             self._system_template, personality
@@ -76,7 +78,7 @@ class LLMClient:
     async def call(self, task: str, memory_doc: str) -> dict:
         """POST to Ollama /api/generate and return parsed JSON response."""
         prompt = self._build_prompt(memory_doc, task)
-        async with httpx.AsyncClient(timeout=120.0) as client:
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
             resp = await client.post(
                 f"{self.base_url}/api/generate",
                 json={"model": self.model, "prompt": prompt, "stream": False},

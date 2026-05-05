@@ -8,6 +8,7 @@ gossip_timeout_ms: 2000            # per-peer write gossip timeout (fire-and-for
 ddl_gossip_timeout_ms: 5000        # DDL gossip is synchronous; longer timeout
 llm_model: "llama3.2"              # Ollama model name
 llm_base_url: "http://localhost:11434"  # Ollama base URL
+llm_timeout_s: 120                 # seconds to wait for LLM response (increase for CPU-only)
 data_dir: "data"                   # directory for memory doc files ({data_dir}/{node_id}.md)
 
 nodes:
